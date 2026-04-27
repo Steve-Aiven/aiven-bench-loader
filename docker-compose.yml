@@ -1,0 +1,44 @@
+# Aiven OpenSearch k-NN benchmark — Docker Compose
+#
+# Usage:
+#   # One-time: build the offline corpus (downloads model weights ~270 MB, then
+#   # runs entirely locally — no API key, no cloud billing).
+#   docker compose run --rm bench bench-build-corpus \
+#       --doc-count 5000 --query-count 5000 --dataset mixed
+#
+#   # One-time: compute brute-force ground truth (CPU only, minutes)
+#   docker compose run --rm bench bench-build-groundtruth
+#
+#   # Open the benchmark UI at http://localhost:8501
+#   docker compose up bench
+#
+#   # Run a benchmark directly from the CLI (bypasses the UI)
+#   docker compose run --rm bench bench-index \
+#       --doc-count 5000 --embed-dim 768 --label "v3.3/faiss/in_memory"
+
+services:
+  bench:
+    build: .
+    image: aiven-knn-bench:latest
+    env_file:
+      - .env
+    environment:
+      # Results dir is read by both the UI and the runner thread.
+      RESULTS_DIR: /app/results
+      # HuggingFace model + dataset cache — avoids re-downloading model
+      # weights and MS MARCO (~270 MB + ~3 GB) on every corpus build.
+      HF_HOME: /home/bench/.cache/huggingface
+    ports:
+      - "8501:8501"
+    volumes:
+      # Benchmark reports (JSON + Markdown) and the job queue.
+      - ./results:/app/results
+      # Pre-built corpus (parquet + npy).  Read-write so bench-build-corpus
+      # can write into it; measurement commands only read.
+      - ./corpus:/app/corpus
+      # HuggingFace cache — model weights and dataset downloads persist
+      # across docker compose runs.  Shared by sentence-transformers and the
+      # HF datasets library.
+      - ./.hf-cache:/home/bench/.cache/huggingface
+    # Restart policy: keep the UI alive if the runner thread panics.
+    restart: unless-stopped

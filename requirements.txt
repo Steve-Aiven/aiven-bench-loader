@@ -1,0 +1,23 @@
+# ── OpenSearch client ─────────────────────────────────────────────────────────
+opensearch-py>=3.1,<4
+
+# ── Embedding (local, no API key required) ────────────────────────────────────
+# sentence-transformers runs the model locally. The default model
+# (nomic-ai/nomic-embed-text-v1.5) is downloaded once to the HF cache on
+# first use; subsequent runs are fully offline.
+sentence-transformers>=3.0,<4
+
+# ── Numeric / data ───────────────────────────────────────────────────────────
+numpy>=2.0,<3
+
+# ── HTTP client (bench-plan-change Aiven REST API + AivenDiscovery) ──────────
+httpx>=0.27,<1
+
+# ── Streamlit dashboard + charts ─────────────────────────────────────────────
+streamlit>=1.35,<2
+plotly>=5.22,<6
+pandas>=2.2,<3
+
+# ── HuggingFace datasets (bench-build-corpus) ─────────────────────────────────
+datasets>=3.0,<5
+pyarrow>=15

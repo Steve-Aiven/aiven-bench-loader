@@ -1,0 +1,37 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Corpus data (large binary files — build locally with bench-build-corpus)
+# Use /corpus/ to anchor to the repo root, not the Python package.
+/corpus/
+/corpus_*/
+*.npy
+*.parquet
+
+# Benchmark results
+results/
+
+# HF dataset cache
+.hf-cache/
+
+# Terraform state and secrets
+infra/terraform/.terraform/
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.backup
+infra/terraform/*.tfplan
+infra/terraform/terraform.tfvars
+
+# IDE
+.cursor/
+
+# macOS
+.DS_Store

@@ -1,0 +1,26 @@
+# Local-only artifacts that should never end up in the image
+.venv/
+.env
+*.env
+
+# Outputs
+results/
+data/
+
+# Python build/cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Editor / OS metadata
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Tests / docs - not needed at runtime
+README.md
