@@ -219,10 +219,16 @@ def build_index_mapping(spec: KnnSpec) -> dict[str, Any]:
         # IVF needs nlist tuned per dataset; 256 is a safe default for 100k–1M.
         method_params = {"nlist": 256, "nprobes": 16}
 
+    # Faiss does not support "cosinesimil" — use "innerproduct" with
+    # L2-normalised vectors instead (mathematically equivalent).
+    effective_space_type = spec.space_type
+    if spec.engine == "faiss" and spec.space_type == "cosinesimil":
+        effective_space_type = "innerproduct"
+
     method_block: dict[str, Any] = {
         "name": spec.method,
         "engine": spec.engine,
-        "space_type": spec.space_type,
+        "space_type": effective_space_type,
         "parameters": method_params,
     }
 
@@ -306,6 +312,33 @@ def wait_for_status(
     timeout: str = "30s",
 ) -> None:
     client.cluster.health(index=index, wait_for_status=status, timeout=timeout)
+
+
+def force_merge(
+    client: OpenSearch,
+    index: str,
+    *,
+    max_num_segments: int = 1,
+    timeout: str = "300s",
+) -> None:
+    """
+    Force-merge the index to at most ``max_num_segments`` Lucene segments.
+
+    Fewer segments means fewer per-shard HNSW graph traversals during search,
+    producing more stable and lower latency — closer to what a fully-optimised
+    production index delivers.  OSB's vectorsearch workload does the same via
+    its force-merge-index procedure.
+
+    The call blocks until the merge completes or ``timeout`` elapses.  For
+    large on-disk indexes a segment count of 1 can take several minutes; set
+    ``timeout`` accordingly (default 300 s).
+    """
+    client.indices.forcemerge(
+        index=index,
+        params={"max_num_segments": str(max_num_segments), "timeout": timeout},
+    )
+    # Wait for the index to return to green after the merge.
+    wait_for_status(client, index, status="green", timeout=timeout)
 
 
 def get_index_stats(client: OpenSearch, index: str) -> dict[str, Any]:

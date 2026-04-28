@@ -3,8 +3,9 @@ Timing and percentile helpers used across all benchmark scripts.
 
 Latency distributions in benchmarks are almost never symmetric - a small
 number of slow requests dominate the tail. Reporting only the mean hides
-those tail effects, so every benchmark in this tool reports p50, p95, p99,
-and the maximum observation. That matches what you would look at when
+those tail effects, so every benchmark in this tool reports p50, p90, p95,
+p99, p99.9, and the maximum observation. This matches the percentile set
+reported by OpenSearch Benchmark (OSB) and is what you would look at when
 deciding whether a service is "fast enough" for a real workload.
 """
 
@@ -37,19 +38,30 @@ def stopwatch() -> Iterator[dict[str, float]]:
 
 def percentiles_ms(values_ms: list[float]) -> dict[str, float]:
     """
-    Return p50, p95, p99, max, and mean from a list of millisecond samples.
+    Return p50, p90, p95, p99, p99.9, max, and mean from a list of
+    millisecond samples.
+
+    p90 and p99.9 are added to match the percentile set reported by
+    OpenSearch Benchmark (OSB), giving finer visibility into the tail
+    without requiring a full histogram.
 
     Empty inputs return zeros so report templates never have to special-case
     a benchmark that produced no observations.
     """
     if not values_ms:
-        return {"p50_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0, "max_ms": 0.0, "mean_ms": 0.0, "count": 0}
+        return {
+            "p50_ms": 0.0, "p90_ms": 0.0, "p95_ms": 0.0,
+            "p99_ms": 0.0, "p999_ms": 0.0, "max_ms": 0.0,
+            "mean_ms": 0.0, "count": 0,
+        }
 
     arr = np.asarray(values_ms, dtype=float)
     return {
         "p50_ms":  float(np.percentile(arr, 50)),
+        "p90_ms":  float(np.percentile(arr, 90)),
         "p95_ms":  float(np.percentile(arr, 95)),
         "p99_ms":  float(np.percentile(arr, 99)),
+        "p999_ms": float(np.percentile(arr, 99.9)),
         "max_ms":  float(arr.max()),
         "mean_ms": float(arr.mean()),
         "count":   int(arr.size),

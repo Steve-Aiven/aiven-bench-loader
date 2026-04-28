@@ -107,19 +107,42 @@ class JobQueue:
         """
         Return the first pending job without removing it from the queue.
 
-        The runner marks it ``running`` via ``mark_running`` immediately after
-        so the same job is not returned twice.  Returns None if nothing is
-        pending.
+        Before returning a job, checks its ``depends_on`` field.  If the
+        dependency job ended in ``failed``, this job is automatically marked
+        ``skipped`` and the search continues to the next pending job.
+
+        The runner marks the returned job ``running`` via ``mark_running``
+        immediately after so the same job is not returned twice.
+        Returns None if nothing is pending (or runnable).
         """
         result: BenchmarkJob | None = None
 
         def _fn(fh):
             nonlocal result
             jobs = self._read_locked(fh)
+            # Build a quick state lookup for dependency resolution.
+            state_by_id = {j["job_id"]: j.get("state", "pending") for j in jobs}
+            changed = False
             for job_dict in jobs:
-                if job_dict.get("state") == "pending":
-                    result = BenchmarkJob.from_dict(job_dict)
-                    break
+                if job_dict.get("state") != "pending":
+                    continue
+                dep = job_dict.get("depends_on", "")
+                if dep and state_by_id.get(dep) == "failed":
+                    # Dependency failed — skip this job automatically.
+                    job_dict["state"] = "skipped"
+                    job_dict["finished_at"] = _utcnow()
+                    job_dict["error_message"] = (
+                        f"Skipped: dependency job {dep[:8]}… failed."
+                    )
+                    changed = True
+                    continue
+                if dep and state_by_id.get(dep) in ("pending", "running"):
+                    # Dependency not yet finished — skip for now, try later.
+                    continue
+                result = BenchmarkJob.from_dict(job_dict)
+                break
+            if changed:
+                self._write_locked(fh, jobs)
 
         self._with_lock(_fn)
         return result
@@ -174,16 +197,79 @@ class JobQueue:
         return sum(1 for j in self.all_jobs() if j.state == "pending")
 
     def clear_finished(self) -> int:
-        """Remove all ok/failed jobs; return how many were removed."""
+        """Remove all ok/failed/skipped jobs; return how many were removed."""
         removed = 0
 
         def _fn(fh):
             nonlocal removed
             jobs = self._read_locked(fh)
-            kept = [j for j in jobs if j.get("state") not in ("ok", "failed")]
+            kept = [j for j in jobs if j.get("state") not in ("ok", "failed", "skipped")]
             removed = len(jobs) - len(kept)
             if removed:
                 self._write_locked(fh, kept)
 
         self._with_lock(_fn)
         return removed
+
+    def reset_stale_running(self) -> int:
+        """
+        Mark any jobs stuck in ``running`` state as ``failed``.
+
+        Called once at runner startup.  Jobs left in "running" state after a
+        process crash are orphaned — the runner thread that owned them is gone
+        and they will never reach ``mark_done``.  Resetting them to ``failed``
+        makes the situation visible in the UI and allows their dependents
+        (search, recall, stress jobs) to be auto-skipped correctly rather than
+        blocking forever waiting for a dependency that will never finish.
+
+        Returns the number of jobs reset.
+        """
+        reset = 0
+
+        def _fn(fh):
+            nonlocal reset
+            jobs = self._read_locked(fh)
+            for j in jobs:
+                if j.get("state") == "running":
+                    j["state"] = "failed"
+                    j["finished_at"] = _utcnow()
+                    j["error_message"] = (
+                        "Process was restarted while this job was running. "
+                        "Re-submit from the New Test tab if needed."
+                    )
+                    reset += 1
+            if reset:
+                self._write_locked(fh, jobs)
+
+        self._with_lock(_fn)
+        return reset
+
+    def cancel_pending(self, job_ids: list[str] | None = None) -> int:
+        """
+        Mark pending jobs as ``skipped`` so the runner ignores them.
+
+        If ``job_ids`` is given only those jobs are cancelled; otherwise all
+        pending jobs are cancelled.  Jobs that are already ``running`` are not
+        touched — the runner owns them until they finish.
+
+        Returns the number of jobs cancelled.
+        """
+        cancelled = 0
+
+        def _fn(fh):
+            nonlocal cancelled
+            jobs = self._read_locked(fh)
+            for j in jobs:
+                if j.get("state") != "pending":
+                    continue
+                if job_ids is not None and j["job_id"] not in job_ids:
+                    continue
+                j["state"] = "skipped"
+                j["finished_at"] = _utcnow()
+                j["error_message"] = "Cancelled by user."
+                cancelled += 1
+            if cancelled:
+                self._write_locked(fh, jobs)
+
+        self._with_lock(_fn)
+        return cancelled

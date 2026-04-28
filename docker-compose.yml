@@ -10,11 +10,12 @@
 #   docker compose run --rm bench bench-build-groundtruth
 #
 #   # Open the benchmark UI at http://localhost:8501
-#   docker compose up bench
-#
-#   # Run a benchmark directly from the CLI (bypasses the UI)
-#   docker compose run --rm bench bench-index \
-#       --doc-count 5000 --embed-dim 768 --label "v3.3/faiss/in_memory"
+  #   docker compose up bench
+  #   # Open the benchmark UI at http://localhost:8080
+  #
+  #   # Run a benchmark directly from the CLI (bypasses the UI)
+  #   docker compose run --rm bench bench-index \
+  #       --doc-count 5000 --embed-dim 768 --label "v3.3/faiss/in_memory"
 
 services:
   bench:
@@ -29,7 +30,7 @@ services:
       # weights and MS MARCO (~270 MB + ~3 GB) on every corpus build.
       HF_HOME: /home/bench/.cache/huggingface
     ports:
-      - "8501:8501"
+      - "8080:8080"
     volumes:
       # Benchmark reports (JSON + Markdown) and the job queue.
       - ./results:/app/results

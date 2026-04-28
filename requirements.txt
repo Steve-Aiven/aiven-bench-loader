@@ -13,8 +13,11 @@ numpy>=2.0,<3
 # ── HTTP client (bench-plan-change Aiven REST API + AivenDiscovery) ──────────
 httpx>=0.27,<1
 
-# ── Streamlit dashboard + charts ─────────────────────────────────────────────
-streamlit>=1.35,<2
+# ── NiceGUI dashboard + charts ────────────────────────────────────────────────
+# NiceGUI: single-page WebSocket-based UI (replaces Streamlit).
+# All five tabs live in one page; the Queue tab auto-refreshes via ui.timer()
+# without disturbing form state in other tabs.
+nicegui>=1.4
 plotly>=5.22,<6
 pandas>=2.2,<3
 

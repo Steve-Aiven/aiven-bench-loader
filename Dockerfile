@@ -16,6 +16,9 @@ COPY requirements.txt pyproject.toml ./
 COPY src/ ./src/
 
 RUN python3 -m venv /opt/venv \
+    # Install CPU-only PyTorch first to avoid pulling ~3 GB of CUDA/cuDNN libs.
+    # sentence-transformers will find torch already installed and skip the CUDA wheel.
+ && /opt/venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu \
  && /opt/venv/bin/pip install -r requirements.txt \
  && /opt/venv/bin/pip install .
 
@@ -24,12 +27,7 @@ FROM python:3.12-slim AS runtime
 
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    # Streamlit does not need a browser inside the container.
-    STREAMLIT_SERVER_HEADLESS=true \
-    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
-    STREAMLIT_SERVER_PORT=8501 \
-    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+    PYTHONUNBUFFERED=1
 
 # Run as a non-root user.  The uid/gid are fixed so that volume permissions
 # are predictable on hosts that mount results/ or corpus/ from outside the
@@ -46,10 +44,10 @@ COPY --chown=bench:bench dashboard/ /app/dashboard/
 
 USER bench
 
-EXPOSE 8501
+EXPOSE 8080
 
-# Default: open the Streamlit UI (starts the background job runner too).
-# Override to use the CLI instead:
+# Default: open the NiceGUI UI at http://localhost:8080 (starts the background
+# job runner thread automatically). Override to use the CLI instead:
 #   docker compose run --rm bench bench-build-corpus --help
-ENTRYPOINT ["python3", "-m", "streamlit", "run", "/app/dashboard/app.py"]
+ENTRYPOINT ["python3", "/app/dashboard/app.py"]
 CMD []

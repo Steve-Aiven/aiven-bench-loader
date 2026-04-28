@@ -150,6 +150,63 @@ class AivenDiscovery:
             service_uri=svc.get("service_uri"),
         )
 
+    def list_available_plans(self, project: str, service_name: str) -> list[str]:
+        """
+        Return sorted plan names available for the given service's cloud region.
+
+        Calls ``GET /v1/project/{project}/service_types`` to get all OpenSearch
+        plans, then filters to those whose ``regions`` map contains the
+        service's ``cloud_name``.  Falls back to the full unfiltered plan list
+        if the cloud filter matches nothing (e.g. cloud name not found in the
+        plan data).  Returns an empty list only on hard API errors.
+        """
+        try:
+            with httpx.Client(timeout=self.timeout_s) as client:
+                # Fetch the service to get its current cloud and plan.
+                svc_resp = client.get(
+                    f"{_BASE_URL}/project/{project}/service/{service_name}",
+                    headers=self._headers(),
+                )
+                svc_resp.raise_for_status()
+                svc_data = svc_resp.json().get("service", svc_resp.json())
+                cloud = svc_data.get("cloud_name", "")
+
+                # Fetch all available plan definitions for this project.
+                types_resp = client.get(
+                    f"{_BASE_URL}/project/{project}/service_types",
+                    headers=self._headers(),
+                )
+                types_resp.raise_for_status()
+                service_plans = (
+                    types_resp.json()
+                    .get("service_types", {})
+                    .get("opensearch", {})
+                    .get("service_plans", [])
+                )
+
+            def _is_standard(plan_name: str) -> bool:
+                # custom-* plans require special account entitlement and will
+                # be rejected with "Invalid plan or cloud setting" if not enabled.
+                return not plan_name.startswith("custom-")
+
+            all_names = sorted(
+                p["service_plan"]
+                for p in service_plans
+                if "service_plan" in p and _is_standard(p["service_plan"])
+            )
+            if cloud:
+                cloud_names = sorted(
+                    p["service_plan"]
+                    for p in service_plans
+                    if "service_plan" in p
+                    and _is_standard(p["service_plan"])
+                    and cloud in p.get("regions", {})
+                )
+                return cloud_names if cloud_names else all_names
+            return all_names
+        except Exception:
+            return []
+
     def verify_token(self) -> bool:
         """
         Return True if the token is valid by calling ``GET /v1/project``.
@@ -217,5 +274,254 @@ class AivenClient:
                 headers=self._headers(),
                 json={"plan": new_plan},
             )
-            resp.raise_for_status()
+            if not resp.is_success:
+                # Extract Aiven's own error message from the JSON body when available.
+                try:
+                    body = resp.json()
+                    aiven_msg = body.get("message") or str(body)
+                except Exception:
+                    aiven_msg = resp.text
+                raise httpx.HTTPStatusError(
+                    f"Aiven API {resp.status_code}: {aiven_msg}",
+                    request=resp.request,
+                    response=resp,
+                )
             return resp.json()
+
+    def wait_for_running(self, *, timeout_s: int = 600, poll_interval_s: int = 15) -> str:
+        """
+        Block until the service state is ``RUNNING``.
+
+        Returns the final plan name.  Raises ``TimeoutError`` if the service
+        does not reach RUNNING within ``timeout_s`` seconds.
+        """
+        import time as _time
+        deadline = _time.monotonic() + timeout_s
+        while _time.monotonic() < deadline:
+            state, plan = self.get_state_and_plan()
+            if state == "RUNNING":
+                return plan
+            _time.sleep(poll_interval_s)
+        raise TimeoutError(
+            f"Service {self.service_name!r} did not reach RUNNING "
+            f"within {timeout_s}s (last state: {state!r})"
+        )
+
+
+# ── Thanos provisioning helpers ───────────────────────────────────────────────
+
+_THANOS_SERVICE_TYPE = "thanos"
+_THANOS_DEFAULT_PLAN = "startup-4"
+_BENCH_THANOS_NAME   = "bench-metrics"
+
+
+def _thanos_query_uri(client: httpx.Client, base: str, headers: dict, project: str, svc_name: str) -> str:
+    """Return the Prometheus query-frontend URI for a Thanos service, or '' if unavailable."""
+    r = client.get(f"{base}/project/{project}/service/{svc_name}", headers=headers)
+    if r.status_code != 200:
+        return ""
+    svc = r.json().get("service", r.json())
+    ci = svc.get("connection_info", {})
+    return (
+        ci.get("query_frontend_uri")
+        or ci.get("query_uri")
+        or svc.get("service_uri", "")
+    )
+
+
+def detect_thanos_integrations(
+    *,
+    api_token: str,
+    project: str,
+    opensearch_service_name: str,
+) -> list[dict]:
+    """
+    Return all ``metrics`` integrations for the given OpenSearch service,
+    enriched with the Thanos service state and query URI.
+
+    Each dict has keys:
+    - ``thanos_service``: Thanos service name
+    - ``thanos_project``: project it lives in
+    - ``thanos_state``: RUNNING / POWEROFF / REBUILDING / ...
+    - ``query_uri``: Prometheus-compatible query URI ('' if not accessible)
+    - ``active``: bool — whether Aiven considers the integration active
+    - ``integration_id``: str or None
+    - ``same_project``: bool — whether Thanos is in the same project as caller
+    """
+    headers = {"Authorization": f"aivenv1 {api_token}", "Content-Type": "application/json"}
+    base = _BASE_URL
+
+    with httpx.Client(timeout=30) as client:
+        r = client.get(
+            f"{base}/project/{project}/service/{opensearch_service_name}/integration",
+            headers=headers,
+        )
+        r.raise_for_status()
+        integrations = r.json().get("service_integrations", [])
+
+        results = []
+        for integ in integrations:
+            if integ.get("integration_type") != "metrics":
+                continue
+            dest_svc  = integ.get("dest_service", "")
+            dest_proj = integ.get("dest_project", project)
+
+            # Fetch Thanos state (may be a cross-project reference)
+            state_r = client.get(
+                f"{base}/project/{dest_proj}/service/{dest_svc}",
+                headers=headers,
+            )
+            thanos_state = "unknown"
+            query_uri    = ""
+            if state_r.status_code == 200:
+                thanos_svc = state_r.json().get("service", state_r.json())
+                thanos_state = thanos_svc.get("state", "unknown")
+                ci = thanos_svc.get("connection_info", {})
+                query_uri = (
+                    ci.get("query_frontend_uri")
+                    or ci.get("query_uri")
+                    or thanos_svc.get("service_uri", "")
+                )
+
+            results.append({
+                "thanos_service":  dest_svc,
+                "thanos_project":  dest_proj,
+                "thanos_state":    thanos_state,
+                "query_uri":       query_uri,
+                "active":          integ.get("active", False),
+                "integration_id":  integ.get("service_integration_id"),
+                "same_project":    dest_proj == project,
+            })
+
+        # Best-first ordering: same project → RUNNING → active
+        results.sort(key=lambda x: (
+            0 if x["same_project"] else 1,
+            0 if x["thanos_state"] == "RUNNING" else 1,
+            0 if x["active"] else 1,
+        ))
+        return results
+
+
+def setup_thanos_for_opensearch(
+    *,
+    api_token: str,
+    project: str,
+    opensearch_service_name: str,
+    cloud_name: str = "",  # kept for API compatibility, not used (Aiven inherits project default)
+    thanos_service_name: str = _BENCH_THANOS_NAME,
+    thanos_plan: str = _THANOS_DEFAULT_PLAN,
+    wait_timeout_s: int = 300,
+) -> tuple[str, str]:
+    """
+    Ensure a Thanos service in ``project`` is receiving metrics from
+    ``opensearch_service_name``, creating one if needed.
+
+    Decision logic (in priority order):
+    1. If there's already a RUNNING Thanos in **the same project**, return its
+       query URI immediately — no new service is created.
+    2. Otherwise create ``thanos_service_name`` (startup-4, same project),
+       wait for it to reach RUNNING, then return its URI.
+
+    Returns ``(query_uri, thanos_service_name)`` where ``query_uri`` is the
+    Prometheus-compatible Thanos query-frontend URL.
+    Raises on any unrecoverable API error.
+    """
+    import time as _time
+
+    headers = {"Authorization": f"aivenv1 {api_token}", "Content-Type": "application/json"}
+    base = _BASE_URL
+
+    # ── 1. Check existing integrations ────────────────────────────────────
+    existing = detect_thanos_integrations(
+        api_token=api_token,
+        project=project,
+        opensearch_service_name=opensearch_service_name,
+    )
+    same_project_running = [
+        e for e in existing
+        if e["same_project"] and e["thanos_state"] == "RUNNING" and e["query_uri"]
+    ]
+    if same_project_running:
+        best = same_project_running[0]
+        print(
+            f"[thanos-setup] Using existing RUNNING Thanos "
+            f"'{best['thanos_service']}' in project '{best['thanos_project']}' "
+            f"(active={best['active']})."
+        )
+        return best["query_uri"], best["thanos_service"]
+
+    with httpx.Client(timeout=60) as client:
+        # ── 2. Create Thanos service if it doesn't exist ──────────────────
+        check = client.get(
+            f"{base}/project/{project}/service/{thanos_service_name}",
+            headers=headers,
+        )
+        if check.status_code == 404:
+            print(f"[thanos-setup] Creating Thanos service '{thanos_service_name}'…")
+            # Thanos create does not accept cloud_name; the project's default cloud is used.
+            resp = client.post(
+                f"{base}/project/{project}/service",
+                headers=headers,
+                json={
+                    "plan":         thanos_plan,
+                    "service_name": thanos_service_name,
+                    "service_type": _THANOS_SERVICE_TYPE,
+                },
+            )
+            resp.raise_for_status()
+        elif check.status_code == 200:
+            print(f"[thanos-setup] Thanos service '{thanos_service_name}' already exists.")
+        else:
+            check.raise_for_status()
+
+        # ── 3. Wait for Thanos to reach RUNNING ───────────────────────────
+        print(f"[thanos-setup] Waiting for '{thanos_service_name}' to reach RUNNING…")
+        deadline = _time.monotonic() + wait_timeout_s
+        state = "UNKNOWN"
+        while _time.monotonic() < deadline:
+            r = client.get(
+                f"{base}/project/{project}/service/{thanos_service_name}",
+                headers=headers,
+            )
+            r.raise_for_status()
+            svc = r.json().get("service", r.json())
+            state = svc.get("state", "UNKNOWN")
+            if state == "RUNNING":
+                break
+            print(f"[thanos-setup]   state={state!r} — waiting…")
+            _time.sleep(15)
+        else:
+            raise TimeoutError(
+                f"Thanos service '{thanos_service_name}' did not reach RUNNING "
+                f"within {wait_timeout_s}s (last state: {state!r})"
+            )
+        print(f"[thanos-setup] '{thanos_service_name}' is RUNNING.")
+
+        # ── 4. Confirm metrics integration (auto-created by Aiven) ────────
+        integ_r = client.get(
+            f"{base}/project/{project}/service/{thanos_service_name}/integration",
+            headers=headers,
+        )
+        integrations = integ_r.json().get("service_integrations", [])
+        os_integ = next(
+            (i for i in integrations
+             if i.get("source_service") == opensearch_service_name
+             and i.get("integration_type") == "metrics"),
+            None,
+        )
+        if os_integ:
+            print(
+                f"[thanos-setup] Metrics integration confirmed: "
+                f"'{opensearch_service_name}' → '{thanos_service_name}' "
+                f"active={os_integ.get('active')}."
+            )
+        else:
+            print(
+                "[thanos-setup] Metrics integration not yet visible — "
+                "Aiven will provision it automatically."
+            )
+
+        # ── 5. Return the Thanos query-frontend URI ────────────────────────
+        query_uri = _thanos_query_uri(client, base, headers, project, thanos_service_name)
+        print(f"[thanos-setup] Thanos query URI ready.")
+        return query_uri, thanos_service_name

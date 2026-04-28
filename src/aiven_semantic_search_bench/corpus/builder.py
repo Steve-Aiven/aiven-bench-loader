@@ -141,10 +141,14 @@ def build_corpus(
     write_embeddings(out_dir, "docs_embeddings", docs_vecs)
     write_embeddings(out_dir, "queries_embeddings", queries_vecs)
 
-    # Derive supported dims: every power-of-2 step up to max_dim.
-    supported = [d for d in SUPPORTED_DIMS if d <= max_dim]
-    if max_dim not in supported:
-        supported.append(max_dim)
+    # Use the model's actual output dim (may be < max_dim for non-Matryoshka
+    # models like bge-small-en-v1.5 which outputs 384d, not 768d).
+    actual_dim = int(docs_vecs.shape[1])
+
+    # Derive supported dims: every power-of-2 step up to actual_dim.
+    supported = [d for d in SUPPORTED_DIMS if d <= actual_dim]
+    if actual_dim not in supported:
+        supported.append(actual_dim)
 
     manifest = {
         "preset":           preset,
@@ -152,7 +156,7 @@ def build_corpus(
         "target_queries":   target_queries,
         "actual_docs":      int(len(docs_df)),
         "actual_queries":   int(len(queries_df)),
-        "source_dim":       int(max_dim),
+        "source_dim":       actual_dim,
         "supported_dims":   sorted(supported),
         "embed_model":      settings.hf_embed_model,
         "embed_batch_size": int(embed_batch_size),
@@ -214,7 +218,11 @@ def _embed_phase(
         f"batch_size={batch_size}..."
     )
 
-    out = np.zeros((n, max_dim), dtype=np.float32)
+    # Defer array allocation until we know the model's actual output dim.
+    # If the model outputs fewer dims than max_dim (e.g. bge-small=384 vs
+    # max_dim=768), we use the model's actual dim to avoid shape mismatches.
+    out: np.ndarray | None = None
+    actual_dim = max_dim
     last_checkpoint = 0
     t_start = time.perf_counter()
     last_print = t_start
@@ -233,7 +241,18 @@ def _embed_phase(
                 f"Embedding count mismatch at offset {i}: "
                 f"requested {len(batch)}, got {len(vectors)}."
             )
-        out[i : i + len(batch)] = np.asarray(vectors, dtype=np.float32)
+
+        arr = np.asarray(vectors, dtype=np.float32)
+        if out is None:
+            # First batch: discover actual output dimension.
+            actual_dim = arr.shape[1]
+            if actual_dim != max_dim:
+                print(
+                    f"[build-corpus] Model output dim={actual_dim} "
+                    f"(max_dim configured as {max_dim}; using {actual_dim})."
+                )
+            out = np.zeros((n, actual_dim), dtype=np.float32)
+        out[i : i + len(batch)] = arr
 
         now = time.perf_counter()
         if now - last_print >= 5.0 or (i + len(batch)) == n:
@@ -256,7 +275,7 @@ def _embed_phase(
         f"[build-corpus] {kind} embedded in {elapsed:.1f}s "
         f"({n / max(elapsed, 1e-9):.0f}/s)."
     )
-    return out
+    return out if out is not None else np.zeros((0, actual_dim), dtype=np.float32)
 
 
 def _source_counts(df: pd.DataFrame) -> dict[str, int]:

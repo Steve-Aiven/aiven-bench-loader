@@ -47,63 +47,154 @@ _PREFIX_MODELS: set[str] = {
 # this dimension; benchmarks truncate at load time via Matryoshka slicing.
 DEFAULT_MAX_DIM = 768
 
+# Models that do NOT need trust_remote_code.  Every other model defaults True
+# only if the model_name is in _PREFIX_MODELS (i.e. nomic family).
+_NO_REMOTE_CODE: set[str] = {
+    "BAAI/bge-small-en-v1.5",
+    "BAAI/bge-base-en-v1.5",
+    "BAAI/bge-large-en-v1.5",
+    "sentence-transformers/all-MiniLM-L6-v2",
+    "sentence-transformers/all-MiniLM-L12-v2",
+    "sentence-transformers/all-mpnet-base-v2",
+    "mixedbread-ai/mxbai-embed-large-v1",
+    "Snowflake/snowflake-arctic-embed-m-v2.0",
+}
+
+# Recommended models with their native output dimensions.
+# Entries: (display_name, model_id, dim, description)
+RECOMMENDED_MODELS: list[tuple[str, str, int, str]] = [
+    (
+        "nomic-embed-text-v1.5  (768-dim, best quality)",
+        "nomic-ai/nomic-embed-text-v1.5",
+        768,
+        "MRL-trained, Apache 2.0.  Best retrieval quality in its size class.  "
+        "Requires trust_remote_code=True.",
+    ),
+    (
+        "bge-small-en-v1.5  (384-dim, fastest CPU/GPU)",
+        "BAAI/bge-small-en-v1.5",
+        384,
+        "~4× faster than nomic on CPU, ~2× on MPS.  Good quality for benchmarking. "
+        "No trust_remote_code needed.",
+    ),
+    (
+        "all-MiniLM-L6-v2  (384-dim, very fast CPU)",
+        "sentence-transformers/all-MiniLM-L6-v2",
+        384,
+        "Classic, widely-used 80 MB model.  Fastest CPU option. "
+        "No trust_remote_code needed.",
+    ),
+    (
+        "mxbai-embed-large-v1  (1024-dim, highest quality)",
+        "mixedbread-ai/mxbai-embed-large-v1",
+        1024,
+        "Highest retrieval quality; MRL-trained.  Needs HF_EMBED_MAX_DIM=1024. "
+        "Best on MPS / GPU.",
+    ),
+]
+
+
+def _best_device() -> str:
+    """
+    Auto-detect the fastest available compute device.
+
+    Priority: CUDA > MPS (Apple Silicon) > CPU.
+    MPS is available on Mac M-series chips when running natively (not in Docker).
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _optimal_batch_size(device: str) -> int:
+    """Larger batches saturate GPU/MPS faster; smaller batches avoid OOM on CPU."""
+    if device == "cuda":
+        return 512
+    if device == "mps":
+        return 256
+    # CPU: use all available cores via torch inter-op threads.
+    import os
+    cores = os.cpu_count() or 4
+    # 64 per core saturates most CPUs without excessive memory pressure.
+    return min(256, cores * 16)
+
 
 @dataclass
 class HfEmbedder:
     """
-    Local sentence-transformers embedding client.
+    Local sentence-transformers embedding client with automatic device selection.
 
     Parameters
     ----------
     model_name:
         HuggingFace model ID.  Defaults to ``nomic-ai/nomic-embed-text-v1.5``.
+        See ``RECOMMENDED_MODELS`` for a curated list with speed/quality notes.
     max_dim:
-        Maximum output dimensionality.  The model must support at least this
-        many dimensions.  Embeddings are L2-normalised at this dimension
-        before being stored; benchmark commands then Matryoshka-truncate to
-        the requested ``--embed-dim``.
+        Maximum output dimensionality stored in the corpus.  Embeddings are
+        L2-normalised at this dimension; benchmark commands Matryoshka-truncate
+        to the requested ``--embed-dim``.
     hf_token:
-        Optional HuggingFace Hub token.  Required only for gated models.
-        Set via ``HF_TOKEN`` env var or pass directly.
+        Optional HuggingFace Hub token (gated models only).
     batch_size:
-        Texts per forward pass through the model.  The embedder's
-        ``embed_documents`` / ``embed_queries`` methods further chunk their
-        input into batches of this size.
+        Texts per forward pass.  Defaults to ``None`` which auto-selects based
+        on the device (512 for CUDA, 256 for MPS, 64–256 for CPU).
     trust_remote_code:
-        Required for ``nomic-ai/nomic-embed-text-v1.5`` which ships a custom
-        pooling layer.  Defaults to True.
+        Required for nomic-embed models.  Auto-set based on model name if None.
     device:
-        PyTorch device string.  Defaults to ``"cpu"``; set to ``"cuda"`` or
-        ``"mps"`` for GPU acceleration.
+        PyTorch device string.  ``None`` auto-detects: CUDA > MPS > CPU.
+        On Apple Silicon Macs running natively (not Docker), this will be
+        ``"mps"`` giving ~5–10× speedup over CPU.
     """
 
     model_name: str = "nomic-ai/nomic-embed-text-v1.5"
     max_dim: int = DEFAULT_MAX_DIM
     hf_token: str | None = None
-    batch_size: int = 64
-    trust_remote_code: bool = True
-    device: str = "cpu"
+    batch_size: int | None = None
+    trust_remote_code: bool | None = None
+    device: str | None = None
     _model: object = field(init=False, repr=False, default=None)
+    _device: str = field(init=False, repr=False, default="cpu")
+    _batch_size: int = field(init=False, repr=False, default=64)
 
     def __post_init__(self) -> None:
+        import os
         from sentence_transformers import SentenceTransformer
 
-        kwargs: dict = {
-            "trust_remote_code": self.trust_remote_code,
-            "device": self.device,
-        }
+        self._device = self.device if self.device else _best_device()
+        self._batch_size = self.batch_size if self.batch_size else _optimal_batch_size(self._device)
+
+        # Tune PyTorch CPU thread count when running on CPU so we use all cores.
+        if self._device == "cpu":
+            try:
+                import torch
+                n_threads = os.cpu_count() or 4
+                torch.set_num_threads(n_threads)
+                torch.set_num_interop_threads(max(1, n_threads // 2))
+            except Exception:
+                pass
+
+        needs_remote = self.model_name in _PREFIX_MODELS and self.model_name not in _NO_REMOTE_CODE
+        trc = self.trust_remote_code if self.trust_remote_code is not None else needs_remote
+
+        kwargs: dict = {"trust_remote_code": trc, "device": self._device}
         if self.hf_token:
             kwargs["token"] = self.hf_token
 
         print(
-            f"[hf-embedder] Loading model {self.model_name!r} "
-            f"(device={self.device}, max_dim={self.max_dim}) …"
+            f"[hf-embedder] Loading {self.model_name!r} "
+            f"(device={self._device}, batch={self._batch_size}, max_dim={self.max_dim})"
         )
         self._model = SentenceTransformer(self.model_name, **kwargs)
-        print(f"[hf-embedder] Model loaded.")
+        print(f"[hf-embedder] Model ready.")
 
     def _needs_prefix(self) -> bool:
-        return self.model_name in _PREFIX_MODELS
+        return self.model_name in _PREFIX_MODELS and self.model_name not in _NO_REMOTE_CODE
 
     def _encode(self, texts: list[str]) -> list[list[float]]:
         """Run the model and return float32 lists truncated to max_dim."""
@@ -111,9 +202,9 @@ class HfEmbedder:
 
         vecs = self._model.encode(
             texts,
-            batch_size=self.batch_size,
+            batch_size=self._batch_size,
             show_progress_bar=False,
-            normalize_embeddings=True,   # L2-normalise at the model's native dim
+            normalize_embeddings=True,
             convert_to_numpy=True,
         )
         # Truncate to max_dim (Matryoshka prefix) and re-normalise.
