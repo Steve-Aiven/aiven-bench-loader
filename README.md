@@ -1,46 +1,54 @@
-## OpenSearch k-NN version comparison benchmark
+## Aiven Semantic Search Bench
 
-A self-contained benchmarking tool for comparing k-NN vector search across OpenSearch versions and engine configurations. Run it as a single Docker container — a Streamlit UI lets you log in to Aiven, pick your existing OpenSearch services, build a test matrix, and watch jobs execute with live results.
+The Python benchmark engine for comparing OpenSearch k-NN vector search across versions, engines, and index configurations on Aiven for OpenSearch.
 
-The educational goal is the same as Part 1: the code teaches you how to think about indexing throughput, query latency, recall accuracy, memory footprint, and the trade-offs introduced by different engines, quantization modes, and index configurations — not just to give you a number.
+This project ships in a single Docker image and runs in three modes from the same code:
+
+1. **Loader API (Aiven Application)** — what the companion [`aiven/aiven-bench-orchestrator`](https://github.com/aiven/aiven-bench-orchestrator) deploys into your Aiven project. Exposes a small FastAPI shim (defined in [`loader-api/openapi.yaml`](https://github.com/aiven/aiven-bench-orchestrator/blob/main/loader-api/openapi.yaml)) so the orchestrator can build a corpus, submit jobs, and stream live logs back to its UI.
+2. **Standalone NiceGUI dashboard** — a single-page browser UI you can run locally against your own Aiven OpenSearch services without the orchestrator. Useful for quick experiments and for working on the benchmark code itself.
+3. **CLI commands** — `bench-build-corpus`, `bench-index`, `bench-search`, `bench-recall`, `bench-hybrid`, `bench-stress`, `bench-recover`, `bench-plan-change`. Always available, in any deployment mode.
+
+The educational goal is to teach how to think about indexing throughput, query latency, recall accuracy, memory footprint, and the trade-offs introduced by different engines, quantization modes, and index configurations — not just to give you a single number.
+
+> Repository moved to `github.com/aiven/aiven-semantic-search-bench`. The orchestrator that used to live here in Go is now its own project at `github.com/aiven/aiven-bench-orchestrator`; this repo is Python-only and ships only the benchmark engine and its loader API.
 
 ---
 
 ## Architecture
 
+When deployed by the orchestrator, this image runs as an Aiven Application alongside the OpenSearch services it benchmarks:
+
 ```mermaid
 flowchart LR
-    subgraph container["Docker container (port 8501)"]
-        ui[Streamlit UI]
-        runner[Job runner thread]
-        queue[(results/queue/queue.json)]
+    user[Browser] -->|UI| orch
+
+    subgraph local["Local Docker"]
+        orch["aiven-bench-orchestrator<br/>(Go, :8080)"]
     end
 
-    subgraph host["Host bind-mounts"]
-        corpus[(corpus/)]
-        results[(results/)]
+    subgraph aiven["Aiven project"]
+        loader["Bench Loader (this repo)<br/>FastAPI :8080"]
+        os1[(OpenSearch v2.17)]
+        os2[(OpenSearch v2.19)]
+        os3[(OpenSearch v3.3)]
+        thanos[(Thanos / metrics)]
+        graf[(Grafana)]
     end
 
-    subgraph aiven["Aiven"]
-        api[Aiven REST API]
-        os217[OpenSearch 2.17]
-        os219[OpenSearch 2.19]
-        os33[OpenSearch 3.3]
-    end
-
-    user[Browser] -->|paste token / browse / submit| ui
-    ui -->|list projects + services| api
-    ui -->|enqueue jobs| queue
-    runner -->|pop jobs| queue
-    runner -->|read corpus| corpus
-    runner -->|index / search / recall / hybrid| os217
-    runner -->|index / search / recall / hybrid| os219
-    runner -->|index / search / recall / hybrid| os33
-    runner -->|write reports| results
-    ui -->|read queue + reports| results
+    orch -->|REST: list / create / power services| api[Aiven REST API]
+    orch -->|HTTPS POST /run<br/>SSE log+result| loader
+    loader -->|index / search / recall / hybrid| os1
+    loader -->|index / search / recall / hybrid| os2
+    loader -->|index / search / recall / hybrid| os3
+    os1 -.metrics.-> thanos
+    os2 -.metrics.-> thanos
+    os3 -.metrics.-> thanos
+    thanos --> graf
 ```
 
-The Aiven token never touches disk — it lives in `st.session_state` for the browser session only. The corpus and results directories are bind-mounted from the host so a container restart loses no data.
+The orchestrator owns the UI, the Aiven control plane, target-service selection, and credentials — it sends the OpenSearch URI inline with each job so the loader never persists secrets to disk. The loader owns the corpus, the benchmark code, and a Prometheus `/metrics` endpoint that Thanos scrapes.
+
+When run standalone (no orchestrator), the same container exposes a NiceGUI dashboard on port 8080 instead of the FastAPI shim. The dashboard talks directly to the Aiven REST API using a token you paste at login.
 
 ---
 
@@ -73,11 +81,12 @@ The default `--dataset mixed` preset draws ~25 % from each, with deficits rolled
 | `bench-search`       | implemented | k-NN query latency over multiple rounds                  |
 | `bench-recall`       | implemented | recall@1/5/10/50/100 vs ground truth alongside latency  |
 | `bench-hybrid`       | implemented | BM25 + k-NN hybrid query with optional metadata filter  |
+| `bench-stress`       | implemented | Sustained mixed index+search load with optional plan change |
 | `bench-recover`      | implemented | Cold-start cost after auto-pause (free tier)            |
 | `bench-plan-change`  | implemented | Upgrade / downgrade impact while live (CLI only)        |
 
 ### k-NN configuration matrix
-Every measurement command accepts these flags (also available via the UI matrix builder):
+Every measurement command accepts these flags (also available via the orchestrator UI matrix builder):
 
 | Flag               | Values                                             | Notes                                   |
 | ------------------ | -------------------------------------------------- | --------------------------------------- |
@@ -95,20 +104,42 @@ Every measurement command accepts these flags (also available via the UI matrix 
 
 ---
 
-## Quickstart — Docker (recommended)
+## Recommended path: use the orchestrator
+
+For the full experience — automated Aiven service provisioning, Grafana dashboards, mid-run plan changes, multi-version comparison — drive this image from [`aiven/aiven-bench-orchestrator`](https://github.com/aiven/aiven-bench-orchestrator):
+
+```bash
+git clone https://github.com/aiven/aiven-bench-orchestrator
+cd aiven-bench-orchestrator
+docker compose up --build -d
+open http://localhost:8080
+```
+
+The orchestrator wizard creates four Aiven services (OpenSearch × N, Thanos, Grafana, and an Application running this image), builds the corpus on the loader VM, then lets you submit benchmark matrices and watch them stream live.
+
+Default loader image:
+```
+ghcr.io/aiven/aiven-semantic-search-bench:main
+```
+
+---
+
+## Standalone quickstart (no orchestrator)
+
+Use this path when you want to point the bench at your own pre-existing Aiven OpenSearch services from your laptop, or when developing on the benchmark code itself.
 
 ### Step 0 — copy and configure the env file
 
 ```bash
 cp .env.example .env
 # No API key required for corpus builds — the default model runs locally.
-# OPENSEARCH_URI is optional; the UI resolves it from Aiven automatically.
+# OPENSEARCH_URI is optional; the dashboard resolves it from Aiven automatically.
 ```
 
 ### Step 1 — build the image
 
 ```bash
-docker build -t aiven-knn-bench:latest .
+docker build -t aiven-semantic-search-bench:latest .
 ```
 
 ### Step 2 — build the offline corpus (one-time, free, ~3–10 min)
@@ -133,19 +164,21 @@ Required for `bench-recall`. Reads the corpus and writes `corpus/qrels.npy` — 
 docker compose run --rm bench bench-build-groundtruth
 ```
 
-### Step 4 — open the UI
+### Step 4 — open the standalone dashboard
 
 ```bash
 docker compose up bench
-open http://localhost:8501
+open http://localhost:8080
 ```
 
-In the UI:
+In the dashboard:
 1. **Login** — paste your Aiven personal API token.
 2. **Services** — pick your project, then select up to three OpenSearch services and tag each with a version label (`v2.17`, `v2.19`, `v3.3`).
 3. **New Test** — configure the matrix axes and doc/query counts, then click **Submit**.
 4. **Queue** — watch jobs run one-at-a-time with live logs.
 5. **Results** — charts grouped by version × engine once jobs complete.
+
+The Aiven token never touches disk — it lives in NiceGUI session storage for the browser session only. The corpus and results directories are bind-mounted from the host so a container restart loses no data.
 
 ---
 
@@ -212,7 +245,7 @@ Run on the smallest dataset that's still meaningful (100k docs / 5k queries at 7
 | 3.3     | faiss  | on_disk    | 32x         | binary    | index, search, recall    |
 | 3.3     | lucene | in_memory  | none        | float     | index, search, hybrid    |
 
-The UI deduplicates invalid combinations (e.g. `lucene + ivf`, `lucene + on_disk`, `fp16` on 2.17) and shows the final cell count before submission. Around 30–40 cells in practice; ~1–2 hours wall-clock at 100k pilot scale.
+The dashboard deduplicates invalid combinations (e.g. `lucene + ivf`, `lucene + on_disk`, `fp16` on 2.17) and shows the final cell count before submission. Around 30–40 cells in practice; ~1–2 hours wall-clock at 100k pilot scale.
 
 **Skip rules enforced by the tool:**
 - `ivf` method requires `engine=faiss`
@@ -229,7 +262,7 @@ The UI deduplicates invalid combinations (e.g. `lucene + ivf`, `lucene + on_disk
 Corpus building is **free** — the embedding model runs locally.
 
 - `bench-build-corpus` downloads model weights once (~270 MB for `nomic-ai/nomic-embed-text-v1.5`) then operates fully offline. There is no per-token charge. CPU throughput is roughly 300–600 docs/sec; a 100k-doc build takes 3–6 minutes on a modern laptop.
-- `bench-build-groundtruth`, `bench-index`, `bench-search`, `bench-recall`, `bench-hybrid`, `bench-recover` make **zero** embedding calls. They load pre-computed vectors from `corpus/` and only talk to OpenSearch.
+- `bench-build-groundtruth`, `bench-index`, `bench-search`, `bench-recall`, `bench-hybrid`, `bench-stress`, `bench-recover` make **zero** embedding calls. They load pre-computed vectors from `corpus/` and only talk to OpenSearch.
 - A pilot build (`--doc-count 5000 --query-count 5000`) completes in under a minute and is the recommended first run.
 
 OpenSearch usage is bounded by your Aiven plan.
@@ -249,7 +282,7 @@ The benchmark container does not run the search engine — it talks to remote Ai
 | Disk     | 50 GB SSD   |
 | Network  | Same Aiven cloud region |
 
-Memory breakdown: doc embeddings at 100k × 768 × 4 B ≈ 300 MB; queries similar; brute-force ground truth chunking peaks ~1 GB; sentence-transformers model + Streamlit + opensearch-py ~1 GB overhead.
+Memory breakdown: doc embeddings at 100k × 768 × 4 B ≈ 300 MB; queries similar; brute-force ground truth chunking peaks ~1 GB; sentence-transformers model + dashboard + opensearch-py ~1 GB overhead.
 
 ### 1M docs / 10k queries @ 768-dim
 
@@ -260,7 +293,7 @@ Memory breakdown: doc embeddings at 100k × 768 × 4 B ≈ 300 MB; queries simil
 | Disk     | 200 GB SSD  |
 | Network  | Same Aiven cloud region |
 
-Memory breakdown: doc embeddings at 1M × 768 × 4 B ≈ 3 GB; ground truth chunking adds ~4 GB peak; sentence-transformers model + Streamlit overhead ~1 GB.
+Memory breakdown: doc embeddings at 1M × 768 × 4 B ≈ 3 GB; ground truth chunking adds ~4 GB peak; sentence-transformers model + dashboard overhead ~1 GB.
 
 ### 10M docs full scale
 
@@ -271,11 +304,11 @@ Memory breakdown: doc embeddings at 1M × 768 × 4 B ≈ 3 GB; ground truth chun
 | Disk     | 500 GB SSD  |
 | Network  | Same Aiven cloud region (consider a VM in the same project) |
 
-> **Network is the most important sizing decision.** If the benchmark container is in a different cloud region from the Aiven services, the network RTT (30–80 ms p50 cross-region) dominates every k-NN call and makes version comparisons meaningless. Colocate the container with the services before worrying about CPU or memory.
+> **Network is the most important sizing decision.** If the benchmark container is in a different cloud region from the Aiven services, the network RTT (30–80 ms p50 cross-region) dominates every k-NN call and makes version comparisons meaningless. Colocate the container with the services before worrying about CPU or memory. When deployed via the orchestrator as an Aiven Application, this is automatic — the Application runs in the same project and region as the OpenSearch services.
 
 ---
 
-## Run with Docker Compose
+## Run with Docker Compose (standalone mode)
 
 ```bash
 # One-time corpus build inside Docker:
@@ -285,17 +318,46 @@ docker compose run --rm bench bench-build-corpus \
 # One-time ground truth:
 docker compose run --rm bench bench-build-groundtruth
 
-# Open the UI:
+# Open the standalone NiceGUI dashboard:
 docker compose up bench
-open http://localhost:8501
+open http://localhost:8080
+
+# Or run as the loader API instead (what the orchestrator does in production):
+LOADER_MODE=1 LOADER_API_KEY=dev-key docker compose up bench
+curl -H "Authorization: Bearer dev-key" http://localhost:8080/healthz
 ```
 
 The compose file mounts your local `.env`, `results/`, `corpus/`, and `.hf-cache/` (so model weights and MS MARCO are downloaded only once).
 
 ---
 
+## Loader API contract
+
+The HTTP interface between the orchestrator and this loader is governed by a single **OpenAPI 3.0 spec** that lives in the orchestrator repo at `loader-api/openapi.yaml`. Neither side hand-writes its types.
+
+```
+loader-api/openapi.yaml
+        │
+        ├── oapi-codegen ──────► (orchestrator) internal/loader/protocol.go
+        └── datamodel-codegen ─► (this repo)    dashboard/api_models.py
+```
+
+To regenerate the Pydantic models in this repo after the spec changes:
+
+```bash
+make install-dev   # one-time: create .venv with datamodel-codegen + schemathesis
+make generate      # reads ../aiven-bench-orchestrator/loader-api/openapi.yaml
+```
+
+CI runs `make generate-check` to fail the build if `dashboard/api_models.py` is stale, and `make test-contract` to verify the FastAPI implementation matches the spec via `schemathesis`.
+
+---
+
 ## References
 
+- **Companion repos**
+  - Orchestrator: `https://github.com/aiven/aiven-bench-orchestrator`
+  - This repo:    `https://github.com/aiven/aiven-semantic-search-bench`
 - **Aiven**
   - Aiven for OpenSearch service plans: `https://aiven.io/pricing?product=opensearch`
   - Aiven REST API: `https://api.aiven.io/doc/`

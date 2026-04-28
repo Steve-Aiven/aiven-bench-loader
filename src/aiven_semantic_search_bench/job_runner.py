@@ -1,19 +1,23 @@
 """
 Background job runner daemon.
 
-The Streamlit app imports this module once at startup (via ``ensure_started``).
-A single daemon thread pops jobs from the ``JobQueue`` and dispatches them to
-the appropriate ``cmd_bench_*`` function, capturing stdout/stderr to a per-job
-log file.
+The standalone NiceGUI dashboard imports this module once at startup (via
+``ensure_started``). A single daemon thread pops jobs from the ``JobQueue``
+and dispatches them to the appropriate ``cmd_bench_*`` function, capturing
+stdout/stderr to a per-job log file.
 
 One job runs at a time — this is intentional so that network + CPU pressure
 from one benchmark cell does not contaminate the latency measurements of the
 next.
 
+The loader API (``dashboard/api.py``) does **not** use this runner; the
+orchestrator drives one job at a time over HTTP/SSE and dispatches directly
+to the ``cmd_bench_*`` functions.
+
 Thread safety:
-  - ``ensure_started`` is idempotent and safe to call from the Streamlit
+  - ``ensure_started`` is idempotent and safe to call from the NiceGUI
     main thread on every page render.
-  - The runner thread and the Streamlit thread only share state via the
+  - The runner thread and the NiceGUI thread only share state via the
     ``JobQueue`` file (which uses ``flock`` for mutual exclusion).
 """
 
@@ -320,7 +324,7 @@ def ensure_started(results_dir: str = "results") -> None:
     Start the runner daemon thread if it has not already been started.
 
     Safe to call multiple times — subsequent calls are no-ops.  Designed to
-    be called at Streamlit app startup (e.g. top of the main app file or in
+    be called at NiceGUI app startup (e.g. top of the main app file or in
     a shared ``utils.py`` imported by every page).
     """
     global _started

@@ -1,34 +1,47 @@
-# Aiven OpenSearch k-NN benchmark — Docker Compose
+# Aiven Semantic Search Bench — Docker Compose
+#
+# Two run modes share the same image:
+#   1. Standalone NiceGUI dashboard (default) — useful for local development
+#      against your own Aiven OpenSearch services.
+#   2. Loader API (LOADER_MODE=1) — what the aiven-bench-orchestrator deploys
+#      as an Aiven Application; exposes the FastAPI shim defined in
+#      ../aiven-bench-orchestrator/loader-api/openapi.yaml.
 #
 # Usage:
-#   # One-time: build the offline corpus (downloads model weights ~270 MB, then
+#   # Build the offline corpus once (downloads ~270 MB of model weights, then
 #   # runs entirely locally — no API key, no cloud billing).
 #   docker compose run --rm bench bench-build-corpus \
 #       --doc-count 5000 --query-count 5000 --dataset mixed
 #
-#   # One-time: compute brute-force ground truth (CPU only, minutes)
+#   # Compute brute-force ground truth (CPU only, minutes).
 #   docker compose run --rm bench bench-build-groundtruth
 #
-#   # Open the benchmark UI at http://localhost:8501
-  #   docker compose up bench
-  #   # Open the benchmark UI at http://localhost:8080
-  #
-  #   # Run a benchmark directly from the CLI (bypasses the UI)
-  #   docker compose run --rm bench bench-index \
-  #       --doc-count 5000 --embed-dim 768 --label "v3.3/faiss/in_memory"
+#   # Open the standalone NiceGUI dashboard at http://localhost:8080
+#   docker compose up bench
+#
+#   # Run the loader API instead of the dashboard:
+#   LOADER_MODE=1 LOADER_API_KEY=dev-key docker compose up bench
+#
+#   # Run a benchmark directly from the CLI (bypasses both UIs)
+#   docker compose run --rm bench bench-index \
+#       --doc-count 5000 --embed-dim 768 --label "v3.3/faiss/in_memory"
 
 services:
   bench:
     build: .
-    image: aiven-knn-bench:latest
+    image: aiven-semantic-search-bench:latest
     env_file:
       - .env
     environment:
-      # Results dir is read by both the UI and the runner thread.
+      # Results dir is read by both the dashboard and the runner thread.
       RESULTS_DIR: /app/results
       # HuggingFace model + dataset cache — avoids re-downloading model
       # weights and MS MARCO (~270 MB + ~3 GB) on every corpus build.
       HF_HOME: /home/bench/.cache/huggingface
+      # Set LOADER_MODE=1 (and LOADER_API_KEY) in .env to expose the FastAPI
+      # loader shim instead of the standalone NiceGUI dashboard.
+      LOADER_MODE: ${LOADER_MODE:-}
+      LOADER_API_KEY: ${LOADER_API_KEY:-}
     ports:
       - "8080:8080"
     volumes:
@@ -41,5 +54,5 @@ services:
       # across docker compose runs.  Shared by sentence-transformers and the
       # HF datasets library.
       - ./.hf-cache:/home/bench/.cache/huggingface
-    # Restart policy: keep the UI alive if the runner thread panics.
+    # Restart policy: keep the service alive if the runner thread panics.
     restart: unless-stopped

@@ -2242,7 +2242,7 @@ ui.run(
     host="0.0.0.0",
     port=8080,
     favicon="🔍",
-    storage_secret="aiven-knn-bench-ui",
+    storage_secret="aiven-semantic-search-bench-ui",
     dark=False,
     show=False,
     reload=False,

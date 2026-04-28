@@ -8,8 +8,10 @@ and fill in the values.
 What's required and when
 ------------------------
 - ``OPENSEARCH_URI`` / ``OPENSEARCH_INDEX`` — needed by CLI measurement
-  commands when not going through the Streamlit UI.  The UI resolves the URI
-  from the Aiven API automatically; the CLI falls back to this env var.
+  commands when not going through one of the UIs. The standalone NiceGUI
+  dashboard resolves the URI from the Aiven API automatically; the loader
+  API receives the URI inline with each /run request from the orchestrator;
+  the CLI falls back to this env var.
 - ``HF_EMBED_MODEL`` — the sentence-transformers model used by
   ``bench-build-corpus``.  Defaults to ``nomic-ai/nomic-embed-text-v1.5``.
 - ``HF_TOKEN`` — optional HuggingFace Hub token.  Required only for gated
@@ -19,7 +21,8 @@ What's required and when
 - ``EMBED_DIM`` — the dimension used at benchmark time (must be ≤
   ``HF_EMBED_MAX_DIM``; Matryoshka-truncated from the stored max).
 - ``AIVEN_API_TOKEN / PROJECT / SERVICE_NAME`` — optional; only needed by
-  the CLI ``bench-plan-change`` command (not used by the UI flow).
+  the CLI ``bench-plan-change`` and the stress benchmark when it triggers
+  a mid-run plan change. The UI flows do not read these env vars.
 """
 
 from __future__ import annotations

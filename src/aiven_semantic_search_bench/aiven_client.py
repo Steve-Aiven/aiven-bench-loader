@@ -4,13 +4,15 @@ Aiven REST API client.
 Two usage patterns:
 
 1. ``AivenDiscovery`` — token-only, no project/service pre-binding.
-   Used by the Streamlit UI to list projects and services after the user
-   pastes their personal API token, and to resolve the OpenSearch URI for
-   a selected service.
+   Used by the standalone NiceGUI dashboard to list projects and services
+   after the user pastes their personal API token, and to resolve the
+   OpenSearch URI for a selected service. The loader API does not use this
+   path — aiven-bench-orchestrator resolves credentials itself and sends
+   them inline with every job request.
 
 2. ``AivenClient`` — bound to a specific project + service.
-   Used by ``bench-plan-change`` to poll service state and trigger plan
-   changes via the Aiven REST API.
+   Used by ``bench-plan-change`` (and the stress benchmark) to poll service
+   state and trigger plan changes via the Aiven REST API.
 
 API reference: https://api.aiven.io/doc/
 """
@@ -50,8 +52,9 @@ class AivenDiscovery:
     passes them per-method. This matches the UI flow where the user selects
     a project from a list and then selects services from a table.
 
-    The token is never persisted to disk; it should live only in
-    ``st.session_state`` on the Streamlit side.
+    The token is never persisted to disk by this client; the standalone
+    dashboard keeps it in NiceGUI session storage and the orchestrator
+    keeps it in its own state file.
     """
 
     api_token: str

@@ -3,8 +3,13 @@ JSON-backed benchmark job queue.
 
 The queue persists to ``{results_dir}/queue/queue.json`` so it survives
 container restarts.  Every mutation is file-locked (``fcntl.flock``) so the
-Streamlit UI thread and the runner thread can safely read/write concurrently
+NiceGUI UI thread and the runner thread can safely read/write concurrently
 without corrupting the file.
+
+Only used by the standalone NiceGUI dashboard. The loader API
+(``dashboard/api.py``) bypasses the queue and dispatches each /run request
+synchronously to the appropriate ``cmd_bench_*`` function — the orchestrator
+owns scheduling on its side.
 
 Queue file format: a JSON array of serialized ``BenchmarkJob`` dicts.
 The file is rewritten atomically on every mutation (write-to-tmp + rename).
