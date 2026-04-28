@@ -24,6 +24,8 @@ pandas>=2.2,<3
 # ── HuggingFace datasets (bench-build-corpus) ─────────────────────────────────
 datasets>=3.0,<5
 pyarrow>=15
+# Required by nomic-ai/nomic-embed-text-v1.5 and other attention-based models.
+einops>=0.7
 
 # ── Loader API (FastAPI shim — used when running as Aiven Application) ────────
 fastapi>=0.115,<1
