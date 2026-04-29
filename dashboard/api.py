@@ -425,12 +425,12 @@ def _dispatch_job(
     raw_spec = spec.spec
     knn_spec = KnnSpec(
         embed_dim=spec.embed_dim,
-        engine=raw_spec.engine.value,
-        method=raw_spec.method.value,
-        space_type=raw_spec.space_type.value,
-        mode=(raw_spec.mode.value if raw_spec.mode else "in_memory"),
-        compression=(raw_spec.compression.value if raw_spec.compression else "none"),
-        data_type=(raw_spec.data_type.value if raw_spec.data_type else "float"),
+        engine=str(raw_spec.engine),
+        method=str(raw_spec.method),
+        space_type=str(raw_spec.space_type),
+        mode=str(raw_spec.mode) if raw_spec.mode else "in_memory",
+        compression=str(raw_spec.compression) if raw_spec.compression else "none",
+        data_type=str(raw_spec.data_type) if raw_spec.data_type else "float",
         m=(raw_spec.hnsw_m or 16),
         ef_construction=(raw_spec.hnsw_ef_construction or 100),
         with_text=(raw_spec.with_text or False),
@@ -534,7 +534,7 @@ def _dispatch_job(
 
         elif bench_type == "hybrid":
             from aiven_semantic_search_bench.bench_hybrid import cmd_bench_hybrid
-            fs_val = spec.filter_selectivity.value if spec.filter_selectivity else "none"
+            fs_val = str(spec.filter_selectivity) if spec.filter_selectivity else "none"
             rc = cmd_bench_hybrid(
                 settings,
                 query_count=spec.query_count,
