@@ -264,17 +264,22 @@ def _sha256_file(path: Path) -> str:
 
 
 def _atomic_replace_corpus(extracted_dir: Path) -> None:
-    parent = _CORPUS_DIR.parent
-    backup = parent / f".corpus-backup-{uuid.uuid4().hex}"
+    """Replace the corpus directory with newly-extracted content.
+
+    Uses shutil.move which falls back to copy+delete when os.rename fails
+    across mount boundaries (common in containerised environments where
+    /data/corpus may be on a different overlay layer than /data).
+    """
+    backup = _CORPUS_DIR.parent / f".corpus-backup-{uuid.uuid4().hex}"
     moved_old = False
     try:
         if _CORPUS_DIR.exists():
-            os.replace(_CORPUS_DIR, backup)
+            shutil.move(str(_CORPUS_DIR), str(backup))
             moved_old = True
-        os.replace(extracted_dir, _CORPUS_DIR)
+        shutil.move(str(extracted_dir), str(_CORPUS_DIR))
     except Exception:
         if moved_old and backup.exists() and not _CORPUS_DIR.exists():
-            os.replace(backup, _CORPUS_DIR)
+            shutil.move(str(backup), str(_CORPUS_DIR))
         raise
     finally:
         if backup.exists():
