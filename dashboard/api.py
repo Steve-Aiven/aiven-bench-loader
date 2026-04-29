@@ -776,18 +776,24 @@ async def run_job(spec: JobSpec) -> EventSourceResponse:
     thread.start()
 
     async def _generate() -> AsyncGenerator[dict, None]:
+        import queue as _q
         try:
             while True:
                 try:
                     item = await asyncio.get_event_loop().run_in_executor(
                         None, lambda: sync_q.get(timeout=30)
                     )
-                    if item is None:
+                except _q.Empty:
+                    # Keep the stream alive while the job thread is still running.
+                    if not thread.is_alive():
                         break
-                    yield item
-                    if item.get("event") == "result":
-                        break
+                    continue
                 except Exception:
+                    break
+                if item is None:
+                    break
+                yield item
+                if item.get("event") == "result":
                     break
         finally:
             _unregister_cancel(spec.job_id)
