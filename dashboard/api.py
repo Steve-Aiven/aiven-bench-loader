@@ -527,9 +527,14 @@ async def corpus_build(config: CorpusConfig) -> EventSourceResponse:
 
     async def _generate() -> AsyncGenerator[dict, None]:
         while True:
-            item = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: sync_q.get(timeout=300)
-            )
+            try:
+                item = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: sync_q.get(timeout=30)
+                )
+            except q_module.Empty:
+                if not thread.is_alive():
+                    break
+                continue
             if item is None:
                 break
             yield item
