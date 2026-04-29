@@ -13,6 +13,7 @@ POST  /run               — submit a benchmark job (SSE log stream + result)
 POST  /cancel/{job_id}   — cancel a running job
 POST  /corpus/build      — build the corpus on this machine (SSE progress)
 POST  /corpus/upload     — upload a pre-built corpus as a .tar.gz archive
+POST  /corpus/fetch      — fetch pre-built corpus from pre-signed URL
 GET   /corpus/status     — current corpus state
 DELETE /corpus           — wipe the corpus directory
 GET   /healthz           — health check (no auth)
@@ -40,19 +41,24 @@ import io
 import json
 import logging
 import os
+import queue
 import shutil
 import sys
 import tarfile
 import tempfile
 import threading
 import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, AsyncIterator
 
+import httpx
 import prometheus_client
 from fastapi import Depends, FastAPI, HTTPException, Request, Security, UploadFile, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 # Generated Pydantic models from the OpenAPI spec — do not hand-edit api_models.py.
@@ -141,6 +147,220 @@ _CORPUS_ALLOWED_FILES = frozenset({
     "queries_embeddings.npy",
     "qrels.npy",
 })
+_CORPUS_REQUIRED_FILES = frozenset({
+    "manifest.json",
+    "docs.parquet",
+    "queries.parquet",
+    "docs_embeddings.npy",
+    "queries_embeddings.npy",
+})
+_corpus_install_lock = threading.Lock()
+
+
+class CorpusFetchRequest(BaseModel):
+    url: str = Field(min_length=1)
+    sha256: str | None = None
+
+
+class _QueueReader(io.RawIOBase):
+    """A file-like bridge for piping async stream chunks into tarfile."""
+
+    def __init__(self) -> None:
+        self._queue: "queue.Queue[bytes | None]" = queue.Queue(maxsize=16)
+        self._buffer = bytearray()
+        self._closed = False
+        self._error: Exception | None = None
+
+    def readable(self) -> bool:
+        return True
+
+    def feed(self, chunk: bytes) -> None:
+        if chunk:
+            while True:
+                if self._error is not None:
+                    err = self._error
+                    self._error = None
+                    raise err
+                try:
+                    self._queue.put(chunk, timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
+
+    def finish(self) -> None:
+        self._queue.put(None)
+
+    def set_error(self, exc: Exception) -> None:
+        self._error = exc
+
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+        if self._closed:
+            return b""
+        if self._error is not None:
+            err = self._error
+            self._error = None
+            raise err
+
+        want_all = size is None or size < 0
+        target = float("inf") if want_all else size
+        while len(self._buffer) < target:
+            item = self._queue.get()
+            if item is None:
+                self._closed = True
+                break
+            self._buffer.extend(item)
+            if want_all:
+                continue
+
+        if want_all:
+            out = bytes(self._buffer)
+            self._buffer.clear()
+            return out
+
+        out = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return out
+
+
+def _extract_allowed_tar_gz(fileobj: io.RawIOBase, dst_dir: Path) -> None:
+    try:
+        with tarfile.open(fileobj=fileobj, mode="r|gz") as tf:
+            for member in tf:
+                if member is None or not member.isfile():
+                    continue
+                name = Path(member.name).name
+                if name not in _CORPUS_ALLOWED_FILES:
+                    continue
+                src = tf.extractfile(member)
+                if src is None:
+                    continue
+                out_path = dst_dir / name
+                with open(out_path, "wb") as out:
+                    shutil.copyfileobj(src, out, length=1 << 20)
+    except tarfile.TarError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid tar.gz archive: {exc}",
+        ) from exc
+
+
+def _validate_corpus_dir(corpus_dir: Path) -> None:
+    missing = sorted(name for name in _CORPUS_REQUIRED_FILES if not (corpus_dir / name).exists())
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Archive missing required files: {', '.join(missing)}",
+        )
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _atomic_replace_corpus(extracted_dir: Path) -> None:
+    parent = _CORPUS_DIR.parent
+    backup = parent / f".corpus-backup-{uuid.uuid4().hex}"
+    moved_old = False
+    try:
+        if _CORPUS_DIR.exists():
+            os.replace(_CORPUS_DIR, backup)
+            moved_old = True
+        os.replace(extracted_dir, _CORPUS_DIR)
+    except Exception:
+        if moved_old and backup.exists() and not _CORPUS_DIR.exists():
+            os.replace(backup, _CORPUS_DIR)
+        raise
+    finally:
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+
+
+@contextmanager
+def _corpus_mutation_guard(action: str) -> Any:
+    with _corpus_lock:
+        if _corpus_state.get("state") == "building":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot {action} corpus while a build is in progress.",
+            )
+    if _job_lock.locked():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot {action} corpus while a benchmark job is running.",
+        )
+    if not _corpus_install_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot mutate corpus while another corpus operation is in progress.",
+        )
+    try:
+        yield
+    finally:
+        _corpus_install_lock.release()
+
+
+def _finalize_installed_corpus(corpus_dir: Path, expected_sha256: str | None = None) -> CorpusStatus:
+    _validate_corpus_dir(corpus_dir)
+    sha = _sha256_file(corpus_dir / "docs_embeddings.npy")
+    if expected_sha256 and expected_sha256.strip() and sha.lower() != expected_sha256.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"docs_embeddings.npy sha256 mismatch: expected {expected_sha256.strip().lower()}, got {sha}",
+        )
+    _atomic_replace_corpus(corpus_dir)
+    built_at = datetime.now(timezone.utc).isoformat()
+    manifest_state = _state_from_manifest(_CORPUS_DIR)
+    with _corpus_lock:
+        _corpus_state.update({
+            "state": "ready",
+            "config": None,
+            "built_at": built_at,
+            "sha256": sha,
+            **manifest_state,
+        })
+    return _corpus_status_obj()
+
+
+async def _extract_streamed_tar_gz_to_dir(stream: AsyncIterator[bytes], dst_dir: Path) -> None:
+    reader = _QueueReader()
+    result: dict[str, Exception | None] = {"error": None}
+
+    def _worker() -> None:
+        try:
+            _extract_allowed_tar_gz(reader, dst_dir)
+        except Exception as exc:
+            result["error"] = exc
+            reader.set_error(exc)
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+
+    try:
+        async for chunk in stream:
+            if result["error"] is not None:
+                break
+            reader.feed(chunk)
+    finally:
+        if result["error"] is None:
+            reader.finish()
+        worker.join()
+
+    if result["error"] is not None:
+        raise result["error"]
+
+
+async def _upload_file_chunks(file: UploadFile, chunk_size: int = 1 << 20) -> AsyncIterator[bytes]:
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        yield chunk
 
 
 # ── Job cancellation registry ─────────────────────────────────────────────────
@@ -597,71 +817,67 @@ async def corpus_upload(file: UploadFile) -> CorpusStatus:
     """
     Upload a pre-built corpus as a .tar.gz archive.
 
-    The archive must contain ``manifest.json`` at its root.  Only the
-    canonical corpus filenames are extracted; any other members are silently
-    skipped.  Rejects while a build or benchmark job is in progress.
+    The archive must contain all required corpus artifacts at its root.
+    Only canonical corpus filenames are extracted; any other members are
+    silently skipped. Rejects while a build or benchmark job is in progress.
     """
-    with _corpus_lock:
-        if _corpus_state.get("state") == "building":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Cannot upload corpus while a build is in progress.",
-            )
-    if _job_lock.locked():
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Cannot upload corpus while a benchmark job is running.",
-        )
-
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
-
-    with tempfile.TemporaryDirectory(prefix="corpus_upload_") as tmp_str:
-        tmp = Path(tmp_str)
+    with _corpus_mutation_guard("upload"):
+        tmp = Path(tempfile.mkdtemp(prefix="corpus-upload-", dir=str(_CORPUS_DIR.parent)))
         try:
-            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
-                for member in tf.getmembers():
-                    name = Path(member.name).name  # strip any directory prefix
-                    if name not in _CORPUS_ALLOWED_FILES:
-                        continue
-                    member.name = name  # force flat extraction
-                    tf.extract(member, path=tmp, filter="data")
-        except tarfile.TarError as exc:
+            await _extract_streamed_tar_gz_to_dir(_upload_file_chunks(file), tmp)
+            return _finalize_installed_corpus(tmp)
+        except HTTPException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        except Exception as exc:
+            shutil.rmtree(tmp, ignore_errors=True)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid tar.gz archive: {exc}",
+                detail=f"Failed to process uploaded archive: {exc}",
             ) from exc
 
-        if not (tmp / "manifest.json").exists():
+
+@app.post("/corpus/fetch", dependencies=[Depends(_require_auth)], operation_id="fetchCorpus")
+async def corpus_fetch(req: CorpusFetchRequest) -> CorpusStatus:
+    url = req.url.strip()
+    if not url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Request field 'url' must be non-empty.",
+        )
+
+    with _corpus_mutation_guard("fetch"):
+        tmp = Path(tempfile.mkdtemp(prefix="corpus-fetch-", dir=str(_CORPUS_DIR.parent)))
+        timeout = httpx.Timeout(timeout=300.0, connect=15.0, read=30.0, write=30.0)
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+                max_redirects=3,
+            ) as client:
+                async with client.stream("GET", url) as resp:
+                    if resp.status_code >= 400:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Unable to download corpus archive from URL (status {resp.status_code}).",
+                        )
+                    await _extract_streamed_tar_gz_to_dir(resp.aiter_bytes(), tmp)
+            return _finalize_installed_corpus(tmp, req.sha256)
+        except HTTPException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        except httpx.HTTPError as exc:
+            shutil.rmtree(tmp, ignore_errors=True)
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Archive must contain manifest.json.",
-            )
-        if not (tmp / "docs_embeddings.npy").exists():
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unable to fetch corpus archive: {exc}",
+            ) from exc
+        except Exception as exc:
+            shutil.rmtree(tmp, ignore_errors=True)
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Archive must contain docs_embeddings.npy.",
-            )
-
-        # Atomically replace the corpus directory contents.
-        shutil.rmtree(str(_CORPUS_DIR), ignore_errors=True)
-        shutil.copytree(str(tmp), str(_CORPUS_DIR))
-
-    sha = _corpus_sha256()
-    built_at = datetime.now(timezone.utc).isoformat()
-    manifest_state = _state_from_manifest(_CORPUS_DIR)
-
-    with _corpus_lock:
-        _corpus_state.update({
-            "state": "ready",
-            "config": None,
-            "built_at": built_at,
-            "sha256": sha,
-            **manifest_state,
-        })
-
-    return _corpus_status_obj()
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to process fetched archive: {exc}",
+            ) from exc
 
 
 @app.get("/healthz")
