@@ -432,7 +432,7 @@ def _dispatch_job(
         derived_source=(raw_spec.derived_source or False),
     )
 
-    target_uri = spec.target_opensearch.uri
+    target_uri = spec.target_opensearch.uri or os.environ.get("OPENSEARCH_URI", "")
     settings = Settings(
         opensearch_uri=target_uri,
         opensearch_index=spec.opensearch_index,
@@ -948,3 +948,29 @@ async def metrics() -> Any:
     from fastapi.responses import PlainTextResponse
     data = prometheus_client.generate_latest()
     return PlainTextResponse(data.decode("utf-8"), media_type="text/plain; version=0.0.4")
+
+
+@app.get("/results", dependencies=[Depends(_require_auth)])
+async def list_results() -> list[dict]:
+    """List available benchmark result files (JSON and Markdown)."""
+    files = []
+    for p in sorted(_RESULTS_DIR.glob("*")):
+        if p.is_file() and p.suffix in (".json", ".md"):
+            stat = p.stat()
+            files.append({
+                "name": p.name,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            })
+    return files
+
+
+@app.get("/results/{filename}", dependencies=[Depends(_require_auth)])
+async def download_result(filename: str) -> Any:
+    """Download a single benchmark result file by name."""
+    from fastapi.responses import FileResponse
+    safe = _RESULTS_DIR / Path(filename).name  # strip any path separators
+    if not safe.exists() or not safe.is_file():
+        raise HTTPException(status_code=404, detail="Result file not found")
+    media_type = "application/json" if safe.suffix == ".json" else "text/markdown"
+    return FileResponse(str(safe), filename=safe.name, media_type=media_type)
