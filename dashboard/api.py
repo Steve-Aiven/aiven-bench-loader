@@ -12,6 +12,7 @@ Endpoints
 POST  /run               — submit a benchmark job (SSE log stream + result)
 POST  /cancel/{job_id}   — cancel a running job
 POST  /corpus/build      — build the corpus on this machine (SSE progress)
+POST  /corpus/upload     — upload a pre-built corpus as a .tar.gz archive
 GET   /corpus/status     — current corpus state
 DELETE /corpus           — wipe the corpus directory
 GET   /healthz           — health check (no auth)
@@ -41,6 +42,8 @@ import logging
 import os
 import shutil
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -48,7 +51,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator
 
 import prometheus_client
-from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Security, UploadFile, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sse_starlette.sse import EventSourceResponse
 
@@ -111,6 +114,33 @@ def _corpus_sha256() -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _state_from_manifest(corpus_dir: Path, fallback_doc_count: int = 0, fallback_query_count: int = 0) -> dict[str, Any]:
+    """Read manifest.json and return a partial _corpus_state dict."""
+    doc_count = fallback_doc_count
+    query_count = fallback_query_count
+    embed_dim = 768
+    try:
+        manifest_path = corpus_dir / "manifest.json"
+        if manifest_path.exists():
+            m = json.loads(manifest_path.read_text())
+            doc_count = m.get("actual_docs", m.get("doc_count", doc_count))
+            query_count = m.get("actual_queries", m.get("query_count", query_count))
+            embed_dim = m.get("source_dim", embed_dim)
+    except Exception:
+        pass
+    return {"doc_count": doc_count, "query_count": query_count, "embed_dim": embed_dim}
+
+
+_CORPUS_ALLOWED_FILES = frozenset({
+    "manifest.json",
+    "docs.parquet",
+    "queries.parquet",
+    "docs_embeddings.npy",
+    "queries_embeddings.npy",
+    "qrels.npy",
+})
 
 
 # ── Job cancellation registry ─────────────────────────────────────────────────
@@ -394,18 +424,11 @@ def _run_corpus_build(config: CorpusConfig, queue: "queue_module.Queue") -> None
         sha = _corpus_sha256()
         built_at = datetime.now(timezone.utc).isoformat()
 
-        # Count docs and queries from manifest or file sizes
-        doc_count = config.docs_n
-        query_count = config.queries_n
-        try:
-            import json as _json
-            manifest = _CORPUS_DIR / "manifest.json"
-            if manifest.exists():
-                m = _json.loads(manifest.read_text())
-                doc_count = m.get("doc_count", doc_count)
-                query_count = m.get("query_count", query_count)
-        except Exception:
-            pass
+        manifest_state = _state_from_manifest(
+            _CORPUS_DIR,
+            fallback_doc_count=config.docs_n,
+            fallback_query_count=config.queries_n,
+        )
 
         with _corpus_lock:
             _corpus_state.update({
@@ -413,9 +436,7 @@ def _run_corpus_build(config: CorpusConfig, queue: "queue_module.Queue") -> None
                 "config": config.model_dump(),
                 "built_at": built_at,
                 "sha256": sha,
-                "doc_count": doc_count,
-                "query_count": query_count,
-                "embed_dim": 768,
+                **manifest_state,
             })
 
         status_obj = _corpus_status_obj()
@@ -569,6 +590,78 @@ async def delete_corpus() -> dict:
         _corpus_state.clear()
         _corpus_state["state"] = "missing"
     return {"deleted": True}
+
+
+@app.post("/corpus/upload", dependencies=[Depends(_require_auth)])
+async def corpus_upload(file: UploadFile) -> CorpusStatus:
+    """
+    Upload a pre-built corpus as a .tar.gz archive.
+
+    The archive must contain ``manifest.json`` at its root.  Only the
+    canonical corpus filenames are extracted; any other members are silently
+    skipped.  Rejects while a build or benchmark job is in progress.
+    """
+    with _corpus_lock:
+        if _corpus_state.get("state") == "building":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Cannot upload corpus while a build is in progress.",
+            )
+    if _job_lock.locked():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot upload corpus while a benchmark job is running.",
+        )
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
+
+    with tempfile.TemporaryDirectory(prefix="corpus_upload_") as tmp_str:
+        tmp = Path(tmp_str)
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
+                for member in tf.getmembers():
+                    name = Path(member.name).name  # strip any directory prefix
+                    if name not in _CORPUS_ALLOWED_FILES:
+                        continue
+                    member.name = name  # force flat extraction
+                    tf.extract(member, path=tmp, filter="data")
+        except tarfile.TarError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid tar.gz archive: {exc}",
+            ) from exc
+
+        if not (tmp / "manifest.json").exists():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Archive must contain manifest.json.",
+            )
+        if not (tmp / "docs_embeddings.npy").exists():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Archive must contain docs_embeddings.npy.",
+            )
+
+        # Atomically replace the corpus directory contents.
+        shutil.rmtree(str(_CORPUS_DIR), ignore_errors=True)
+        shutil.copytree(str(tmp), str(_CORPUS_DIR))
+
+    sha = _corpus_sha256()
+    built_at = datetime.now(timezone.utc).isoformat()
+    manifest_state = _state_from_manifest(_CORPUS_DIR)
+
+    with _corpus_lock:
+        _corpus_state.update({
+            "state": "ready",
+            "config": None,
+            "built_at": built_at,
+            "sha256": sha,
+            **manifest_state,
+        })
+
+    return _corpus_status_obj()
 
 
 @app.get("/healthz")
