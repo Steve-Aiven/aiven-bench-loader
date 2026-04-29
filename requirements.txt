@@ -6,6 +6,10 @@ opensearch-py>=3.1,<4
 # (nomic-ai/nomic-embed-text-v1.5) is downloaded once to the HF cache on
 # first use; subsequent runs are fully offline.
 sentence-transformers>=3.0,<4
+# transformers 5.x has breaking API changes (PreTrainedTokenizerBase moved).
+# Pin to 4.x until sentence-transformers formally supports 5.x.
+transformers>=4.41.0,<5.0
+tokenizers>=0.19,<0.22
 
 # ── Numeric / data ───────────────────────────────────────────────────────────
 numpy>=2.0,<3
