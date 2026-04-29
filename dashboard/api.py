@@ -424,14 +424,15 @@ def _dispatch_job(
     # Build KnnSpec from the received data
     raw_spec = spec.spec
     knn_spec = KnnSpec(
+        embed_dim=spec.embed_dim,
         engine=raw_spec.engine.value,
         method=raw_spec.method.value,
         space_type=raw_spec.space_type.value,
         mode=(raw_spec.mode.value if raw_spec.mode else "in_memory"),
         compression=(raw_spec.compression.value if raw_spec.compression else "none"),
         data_type=(raw_spec.data_type.value if raw_spec.data_type else "float"),
-        hnsw_m=(raw_spec.hnsw_m or 16),
-        hnsw_ef_construction=(raw_spec.hnsw_ef_construction or 100),
+        m=(raw_spec.hnsw_m or 16),
+        ef_construction=(raw_spec.hnsw_ef_construction or 100),
         with_text=(raw_spec.with_text or False),
         with_metadata=(raw_spec.with_metadata or False),
         derived_source=(raw_spec.derived_source or False),
