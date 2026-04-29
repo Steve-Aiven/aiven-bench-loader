@@ -32,6 +32,7 @@ import time
 
 import numpy as np
 
+from .clickhouse_sink import get_sink
 from .config import Settings
 from .corpus import load_corpus
 from .opensearch_client import KnnSpec, get_opensearch_client, reset_index
@@ -147,20 +148,31 @@ def cmd_bench_index(
         payload_with_meta = None
 
     client = get_opensearch_client(uri)
+    sink = get_sink()
 
     results: list[dict] = []
     for bs in batch_sizes:
         print(f"[bench-index] Resetting index and indexing at batch_size={bs}...")
         reset_index(client, settings.opensearch_index, spec=knn)
 
+        bs_label = {"batch_size": str(bs)}
         request_latencies_ms: list[float] = []
+        bulk_failures = 0
         with stopwatch() as sw:
             for batch in chunked(payload, bs):
                 t0 = time.perf_counter()
-                _bulk_index_request(
-                    client, settings.opensearch_index, batch, spec=knn
-                )
-                request_latencies_ms.append((time.perf_counter() - t0) * 1000)
+                try:
+                    _bulk_index_request(
+                        client, settings.opensearch_index, batch, spec=knn
+                    )
+                    elapsed_ms = (time.perf_counter() - t0) * 1000
+                    request_latencies_ms.append(elapsed_ms)
+                    sink.metric("index_bulk_ms", elapsed_ms, labels=bs_label)
+                except Exception:
+                    elapsed_ms = (time.perf_counter() - t0) * 1000
+                    request_latencies_ms.append(elapsed_ms)
+                    bulk_failures += 1
+                    sink.metric("bulk_failures_total", 1.0, labels=bs_label)
 
         client.indices.refresh(index=settings.opensearch_index)
         wall_s = sw["elapsed_s"]
@@ -181,10 +193,15 @@ def cmd_bench_index(
                 "mean_ms":      round(latency_stats["mean_ms"], 1),
             }
         )
+        sink.metric("docs_per_sec", float(docs_per_sec), labels=bs_label)
+        sink.metric("index_p50_ms", float(latency_stats["p50_ms"]), labels=bs_label)
+        sink.metric("index_p95_ms", float(latency_stats["p95_ms"]), labels=bs_label)
+        sink.metric("index_p99_ms", float(latency_stats["p99_ms"]), labels=bs_label)
         print(
             f"[bench-index] batch_size={bs}: "
             f"{docs_per_sec:.1f} docs/sec, p50={latency_stats['p50_ms']:.1f}ms, "
             f"p95={latency_stats['p95_ms']:.1f}ms"
+            + (f", FAILURES={bulk_failures}" if bulk_failures else "")
         )
 
     json_path, md_path = write_report(

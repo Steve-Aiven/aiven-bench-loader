@@ -36,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .clickhouse_sink import get_sink
 from .config import Settings
 from .corpus import load_corpus
 from .opensearch_client import KnnSpec, get_index_stats, get_opensearch_client
@@ -247,6 +248,20 @@ def cmd_bench_hybrid(
         if has_qrels
         else {}
     )
+
+    sink = get_sink()
+    sel_label = {"selectivity": filter_selectivity, "query_mode": query_mode}
+    sink.metric("search_p50_ms", float(lat["p50_ms"]), labels={**sel_label, "phase": "hybrid"})
+    sink.metric("search_p95_ms", float(lat["p95_ms"]), labels={**sel_label, "phase": "hybrid"})
+    sink.metric("search_p99_ms", float(lat["p99_ms"]), labels={**sel_label, "phase": "hybrid"})
+    if has_qrels:
+        for rk, score in recall_results.items():
+            k_value = rk.split("@", 1)[1]
+            sink.metric(
+                "recall_at_k",
+                float(score),
+                labels={**sel_label, "k": k_value, "phase": "hybrid"},
+            )
 
     result_row = {
         "queries":            query_count,

@@ -44,6 +44,7 @@ from urllib.parse import urlparse, unquote
 
 import numpy as np
 
+from .clickhouse_sink import ThrottleState, get_sink
 from .config import Settings
 from .corpus import load_corpus
 from .opensearch_client import (
@@ -57,6 +58,7 @@ from .stats import percentiles_ms
 _SAMPLE_INTERVAL_S = 10
 _ERROR_WARN_THRESHOLD_PCT = 20.0
 _PLAN_POLL_INTERVAL_S = 15  # how often to poll Aiven API for service state
+_DIRECTIVE_POLL_INTERVAL_S = 1.0  # how often to fetch new orchestrator directives
 
 
 # ── Deadline manager ──────────────────────────────────────────────────────────
@@ -328,12 +330,28 @@ def _index_worker(
     lock: threading.Lock,
     spec: KnnSpec,
     thread_offset: int,
+    rank: int,
+    throttle: ThrottleState,
 ) -> None:
+    """
+    Continuous bulk-indexing worker.
+
+    Each worker carries a 0-based ``rank`` and consults ``throttle`` on every
+    iteration. When ``rank >= throttle.target_index`` (orchestrator throttled
+    the pool) or ``throttle.pause_index`` is set, the worker idles for 500 ms
+    rather than terminating, so the orchestrator can ``resume`` or raise the
+    target later in the run.
+    """
     client = get_opensearch_client(uri, timeout=120)
+    sink = get_sink()
     n = len(docs)
     idx = thread_offset % n
 
     while not stop_event.is_set():
+        if rank >= throttle.target_index or throttle.pause_index.is_set():
+            stop_event.wait(timeout=0.5)
+            continue
+
         batch = [docs[(idx + i) % n] for i in range(batch_size)]
         idx = (idx + batch_size) % n
 
@@ -349,8 +367,10 @@ def _index_worker(
                 doc["content"] = text
             body.append(doc)
 
+        t0 = time.perf_counter()
         try:
             resp = client.bulk(body=body)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
             had_errors = 1 if resp.get("errors") else 0
             with lock:
                 counters["index_ops"] += len(batch)
@@ -360,9 +380,19 @@ def _index_worker(
                         if "error" in item.get("index", {})
                     )
                     counters["index_errors"] += n_err or 1
+            sink.metric("index_bulk_ms", elapsed_ms, labels={"rank": str(rank)})
+            if had_errors:
+                sink.metric("bulk_failures_total", float(n_err or 1))
         except Exception:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
             with lock:
                 counters["index_errors"] += batch_size
+            sink.metric(
+                "bulk_failures_total",
+                float(batch_size),
+                labels={"reason": "exception"},
+            )
+            sink.metric("index_bulk_ms", elapsed_ms, labels={"rank": str(rank), "errored": "1"})
 
 
 # ── Worker: continuous k-NN search ───────────────────────────────────────────
@@ -379,12 +409,26 @@ def _search_worker(
     lock: threading.Lock,
     lats: list[float],
     thread_offset: int,
+    rank: int,
+    throttle: ThrottleState,
 ) -> None:
+    """
+    Continuous k-NN search worker.
+
+    See :func:`_index_worker` for the throttle/rank semantics — search workers
+    follow the same pattern using ``throttle.target_search`` and
+    ``throttle.pause_search``.
+    """
     client = get_opensearch_client(uri, timeout=120)
+    sink = get_sink()
     n = len(query_vectors)
     idx = thread_offset % n
 
     while not stop_event.is_set():
+        if rank >= throttle.target_search or throttle.pause_search.is_set():
+            stop_event.wait(timeout=0.5)
+            continue
+
         v = query_vectors[idx % n]
         idx += 1
         t0 = time.perf_counter()
@@ -409,9 +453,11 @@ def _search_worker(
             with lock:
                 counters["search_ops"] += 1
                 lats.append(lat_ms)
+            sink.metric("search_latency_ms", lat_ms, labels={"rank": str(rank)})
         except Exception:
             with lock:
                 counters["search_errors"] += 1
+            sink.metric("search_errors_total", 1.0, labels={"rank": str(rank)})
 
 
 # ── Cluster health snapshot ───────────────────────────────────────────────────
@@ -542,6 +588,12 @@ def cmd_bench_stress(
     first_error_s: float | None = None
     prev: dict[str, int] = {k2: 0 for k2 in counters}
 
+    # Live-tunable worker-pool sizing. Workers poll throttle.target_X and the
+    # pause events; the directive-pump thread mutates this from incoming
+    # bench_control directives written by the orchestrator.
+    throttle = ThrottleState(initial_index=index_clients, initial_search=search_clients)
+    sink = get_sink()
+
     # ── Sampler thread ─────────────────────────────────────────────────────
     def _sampler() -> None:
         nonlocal first_error_s
@@ -594,6 +646,27 @@ def cmd_bench_stress(
             }
             interval_rows.append(row)
 
+            # Per-interval metrics into ClickHouse — orchestrator policy rules
+            # build rolling windows from these. Names follow the contract in
+            # ../aiven-bench-orchestrator (Part A of the rollout plan).
+            sink.metric("index_ops_per_interval", float(delta_io))
+            sink.metric("index_errors_per_interval", float(delta_ie))
+            sink.metric("search_ops_per_interval", float(delta_so))
+            sink.metric("search_errors_per_interval", float(delta_se))
+            sink.metric("error_rate_pct", float(err_rate_pct))
+            if search_p95 is not None:
+                sink.metric("search_p95_ms", float(search_p95))
+            sink.metric(
+                "cluster_health_status",
+                {"green": 0.0, "yellow": 1.0, "red": 2.0}.get(health["status"], 3.0),
+                labels={"status": str(health["status"])},
+            )
+            sink.metric("cluster_nodes", float(health["nodes"]))
+            sink.metric("relocating_shards", float(health["relocating_shards"]))
+            sink.metric("initializing_shards", float(health["initializing_shards"]))
+            sink.metric("unassigned_shards", float(health["unassigned_shards"]))
+            sink.metric("pending_tasks", float(health["pending_tasks"]))
+
             status_icon = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(health["status"], "⚫")
             relocating_note = (
                 f" relocating={health['relocating_shards']}"
@@ -618,6 +691,44 @@ def cmd_bench_stress(
 
     sampler_thread = threading.Thread(target=_sampler, daemon=True, name="stress-sampler")
     sampler_thread.start()
+
+    # ── Directive-pump thread ──────────────────────────────────────────────
+    # Polls bench_control once per second for directives written by the
+    # orchestrator's policy engine and mutates throttle / cancel state in
+    # response. Orchestrator-issued cancels arrive as a "cancel" directive
+    # and short-circuit the deadline loop; throttle/pause/resume mutate the
+    # shared ThrottleState that workers consult.
+    def _directive_pump() -> None:
+        while not stop_event.is_set():
+            stop_event.wait(timeout=_DIRECTIVE_POLL_INTERVAL_S)
+            if stop_event.is_set():
+                break
+            try:
+                directives = sink.poll_directives()
+            except Exception as exc:
+                print(f"[bench-stress] directive poll error: {exc}")
+                continue
+            for d in directives:
+                if d.directive == "cancel":
+                    print(f"[bench-stress] orchestrator → cancel (seq={d.seq})")
+                    sink.log("warn", "control", f"orchestrator cancel (seq={d.seq})")
+                    stop_event.set()
+                    deadline.trim_to(time.perf_counter())
+                    return
+                if d.directive == "sample_recall":
+                    # Not implemented yet; ack so the orchestrator does not retry.
+                    msg = f"sample_recall directive received (seq={d.seq}) — not implemented yet"
+                    print(f"[bench-stress] {msg}")
+                    sink.log("warn", "control", msg)
+                    continue
+                summary = throttle.apply(d)
+                print(f"[bench-stress] orchestrator → {summary} (seq={d.seq})")
+                sink.log("info", "control", f"{summary} (seq={d.seq})")
+
+    directive_thread = threading.Thread(
+        target=_directive_pump, daemon=True, name="stress-directive-pump"
+    )
+    directive_thread.start()
 
     # ── Plan-change thread ─────────────────────────────────────────────────
     pc_thread: threading.Thread | None = None
@@ -655,6 +766,7 @@ def cmd_bench_stress(
                 batch_size=batch_size, stop_event=stop_event,
                 counters=counters, lock=lock, spec=knn,
                 thread_offset=i * (n_docs // max(index_clients, 1)),
+                rank=i, throttle=throttle,
             ))
         for i in range(search_clients):
             futs.append(pool.submit(
@@ -662,6 +774,7 @@ def cmd_bench_stress(
                 k=k, ef_search=knn.ef_search, stop_event=stop_event,
                 counters=counters, lock=lock, lats=lats,
                 thread_offset=i * (n_qvecs // max(search_clients, 1)),
+                rank=i, throttle=throttle,
             ))
 
         # ── Main deadline loop ─────────────────────────────────────────────
@@ -678,6 +791,7 @@ def cmd_bench_stress(
                 pass
 
     sampler_thread.join(timeout=15)
+    directive_thread.join(timeout=5)
     if pc_thread:
         pc_thread.join(timeout=10)
 

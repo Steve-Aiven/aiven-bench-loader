@@ -105,4 +105,16 @@ def write_report(
     }
     json_path.write_text(json.dumps(payload, indent=2))
     md_path.write_text(_render_markdown(name, params, results, notes))
+
+    # Notify the (optional) ClickHouse sink so the loader API can surface the
+    # actual report path on the SSE `result` event and so the orchestrator can
+    # find the report referenced from `bench_runs.summary`. No-op when CH is
+    # not configured.
+    try:
+        from .clickhouse_sink import get_sink
+
+        get_sink().report_written(json_path, md_path)
+    except Exception:
+        pass
+
     return json_path, md_path

@@ -36,3 +36,8 @@ fastapi>=0.115,<1
 uvicorn[standard]>=0.30,<1
 sse-starlette>=2.1,<3
 prometheus-client>=0.21,<1
+
+# ── ClickHouse sink (structured logs + metrics + control directives) ──────────
+# Used when CLICKHOUSE_URL/USER/PASSWORD env vars are set (i.e. when deployed
+# by the orchestrator). Falls back to a no-op sink in CLI / NiceGUI mode.
+clickhouse-connect>=0.7,<1

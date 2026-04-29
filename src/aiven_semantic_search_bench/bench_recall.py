@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .clickhouse_sink import get_sink
 from .config import Settings
 from .corpus import load_corpus
 from .opensearch_client import KnnSpec, get_index_stats, get_opensearch_client
@@ -150,6 +151,16 @@ def cmd_bench_recall(
         f"recall@{rk}": round(recall_sums[rk] / query_count, 4)
         for rk in recall_sums
     }
+
+    sink = get_sink()
+    for rk, score in recall_results.items():
+        # Tag with k so the orchestrator's recall_floor rule can target a
+        # specific k. e.g. labels={"k": "10"} → recall_at_k for k=10.
+        k_value = rk.split("@", 1)[1]
+        sink.metric("recall_at_k", float(score), labels={"k": k_value})
+    sink.metric("search_p50_ms", float(lat["p50_ms"]), labels={"phase": "recall"})
+    sink.metric("search_p95_ms", float(lat["p95_ms"]), labels={"phase": "recall"})
+    sink.metric("search_p99_ms", float(lat["p99_ms"]), labels={"phase": "recall"})
 
     result_row = {
         "queries":    query_count,

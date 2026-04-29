@@ -402,6 +402,9 @@ def _dispatch_job(
     from aiven_semantic_search_bench.config import Settings
     from aiven_semantic_search_bench.opensearch_client import KnnSpec
     from aiven_semantic_search_bench.job_spec import BenchmarkJob
+    from aiven_semantic_search_bench.clickhouse_sink import get_sink
+
+    sink = get_sink()
 
     def _put(event: str, data: str) -> None:
         # asyncio.Queue is not thread-safe, but we can use a thread-safe approach
@@ -409,6 +412,9 @@ def _dispatch_job(
 
     def _log(msg: str) -> None:
         _put("log", msg)
+        # Mirror the SSE log line into ClickHouse so the orchestrator can
+        # query the structured event stream by job_id. No-op when CH is unset.
+        sink.log("info", "stdout", msg)
 
     # Build KnnSpec from the received data
     raw_spec = spec.spec
@@ -453,15 +459,23 @@ def _dispatch_job(
     report_path = ""
     ok = False
 
+    bench_type = spec.bench_type.value if hasattr(spec.bench_type, 'value') else spec.bench_type
+    sink.bind_job(
+        spec.job_id,
+        bench_type=str(bench_type),
+        label=str(spec.service_label or ""),
+        spec=spec.model_dump(mode="json") if hasattr(spec, "model_dump") else {},
+    )
+
     sys.stdout = tee  # type: ignore[assignment]
     sys.stderr = tee  # type: ignore[assignment]
     try:
         if cancel_ev.is_set():
             _log("[loader] Job cancelled before start.")
             _put("result", json.dumps({"ok": False, "error": "cancelled", "report_path": ""}))
+            sink.unbind_job(status="cancelled", summary={"error": "cancelled before start"})
             return
 
-        bench_type = spec.bench_type.value if hasattr(spec.bench_type, 'value') else spec.bench_type
         _log(f"[loader] Starting {bench_type} job {spec.job_id}")
 
         if bench_type == "index":
@@ -565,6 +579,21 @@ def _dispatch_job(
         sys.stdout = sys.__stdout__
         sys.stderr = sys.__stderr__
 
+    # Pull the actual report path the bench module wrote (via reporter.write_report
+    # → sink.report_written). Bench commands do not return paths directly, so this
+    # is the canonical source. Falls back to "" when CH is not configured AND the
+    # bench command did not run far enough to call write_report.
+    last = sink.last_report_path
+    if last is not None:
+        report_path = str(last)
+
+    summary = {
+        "ok": ok,
+        "report_path": report_path,
+        "bench_type": str(bench_type),
+    }
+    sink.unbind_job(status=("ok" if ok else "failed"), summary=summary)
+
     _put("result", json.dumps({"ok": ok, "report_path": report_path}))
 
 
@@ -574,11 +603,26 @@ def _run_corpus_build(config: CorpusConfig, queue: "queue_module.Queue") -> None
     """Runs in a worker thread; puts SSE-style dicts into queue."""
     import queue as queue_module_local
 
+    sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+    from aiven_semantic_search_bench.clickhouse_sink import get_sink
+
+    sink = get_sink()
+    # Synthetic job_id so corpus-build progress shows up alongside benchmark
+    # runs in the bench_logs table; the orchestrator can filter on this prefix.
+    corpus_job_id = f"corpus-{int(time.time())}"
+    sink.bind_job(
+        corpus_job_id,
+        bench_type="corpus_build",
+        label=str(config.dataset or "mixed"),
+        spec=config.model_dump() if hasattr(config, "model_dump") else {},
+    )
+
     def _put(event: str, data: str) -> None:
         queue.put({"event": event, "data": data})
 
     def _log(msg: str) -> None:
         _put("log", msg)
+        sink.log("info", "corpus", msg)
 
     class _Tee(io.TextIOBase):
         def write(self, s: str) -> int:
@@ -662,6 +706,15 @@ def _run_corpus_build(config: CorpusConfig, queue: "queue_module.Queue") -> None
         status_obj = _corpus_status_obj()
         _put("ready", status_obj.model_dump_json())
         _log(f"[corpus] Corpus ready. sha256={sha[:12]}...")
+        sink.unbind_job(
+            status="ok",
+            summary={
+                "sha256": sha,
+                "built_at": built_at,
+                "doc_count": manifest_state.get("doc_count"),
+                "query_count": manifest_state.get("query_count"),
+            },
+        )
 
     except Exception as exc:
         import traceback
@@ -670,6 +723,7 @@ def _run_corpus_build(config: CorpusConfig, queue: "queue_module.Queue") -> None
         with _corpus_lock:
             _corpus_state["state"] = "missing"
         _put("error", str(exc))
+        sink.unbind_job(status="failed", summary={"error": str(exc)})
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr

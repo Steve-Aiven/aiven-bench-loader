@@ -46,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
+from .clickhouse_sink import get_sink
 from .config import Settings
 from .corpus import load_corpus
 from .opensearch_client import (
@@ -152,6 +153,7 @@ def _run_rounds(
     """
     all_latencies: list[float] = []
     results: list[dict] = []
+    sink = get_sink()
 
     for r in range(1, rounds + 1):
         round_lats: list[float] = []
@@ -190,6 +192,11 @@ def _run_rounds(
             "max_ms":  round(s["max_ms"],  1),
             "mean_ms": round(s["mean_ms"], 1),
         })
+        round_label = {"round": str(r)}
+        sink.metric("search_p50_ms", float(s["p50_ms"]), labels=round_label)
+        sink.metric("search_p95_ms", float(s["p95_ms"]), labels=round_label)
+        sink.metric("search_p99_ms", float(s["p99_ms"]), labels=round_label)
+        sink.metric("search_queries", float(len(round_lats)), labels=round_label)
         print(
             f"[bench-search] round {r}/{rounds}: "
             f"p50={s['p50_ms']:.1f}  p90={s['p90_ms']:.1f}  "
@@ -238,6 +245,8 @@ def _run_sustained(
     latencies: list[float] = []
     lock = threading.Lock()
     n_vecs = len(query_vectors)
+    sink = get_sink()
+    error_count = 0
 
     def feeder() -> None:
         idx = 0
@@ -253,14 +262,22 @@ def _run_sustained(
             work_q.put(None)  # sentinel: tell each worker to stop
 
     def worker() -> None:
+        nonlocal error_count
         while True:
             vec = work_q.get()
             if vec is None:
                 break
             t0 = time.perf_counter()
-            _knn_search(client, index, vec, k=k, ef_search=ef_search)
-            with lock:
-                latencies.append((time.perf_counter() - t0) * 1000)
+            try:
+                _knn_search(client, index, vec, k=k, ef_search=ef_search)
+                lat_ms = (time.perf_counter() - t0) * 1000
+                with lock:
+                    latencies.append(lat_ms)
+                sink.metric("search_latency_ms", lat_ms, labels={"mode": "sustained"})
+            except Exception:
+                with lock:
+                    error_count += 1
+                sink.metric("search_errors_total", 1.0, labels={"mode": "sustained"})
 
     t_start = time.perf_counter()
     feeder_thread = threading.Thread(target=feeder, daemon=True)
@@ -276,6 +293,13 @@ def _run_sustained(
 
     s = percentiles_ms(latencies)
     ops_per_sec = round(len(latencies) / elapsed, 1) if elapsed > 0 else 0.0
+
+    sink.metric("qps", float(ops_per_sec), labels={"mode": "sustained"})
+    sink.metric("search_p50_ms", float(s["p50_ms"]), labels={"mode": "sustained"})
+    sink.metric("search_p95_ms", float(s["p95_ms"]), labels={"mode": "sustained"})
+    sink.metric("search_p99_ms", float(s["p99_ms"]), labels={"mode": "sustained"})
+    if error_count > 0:
+        sink.metric("search_errors_total", float(error_count), labels={"mode": "sustained_summary"})
 
     print(
         f"[bench-search] sustained: {len(latencies)} queries in {elapsed:.1f}s "
