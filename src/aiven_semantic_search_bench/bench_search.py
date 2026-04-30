@@ -441,7 +441,7 @@ def cmd_bench_search(
         )
 
     # ── Report ────────────────────────────────────────────────────────────
-    json_path, md_path = write_report(
+    json_path, md_path, _raw_path = write_report(
         "bench-search",
         params={
             "plan_label":            label,

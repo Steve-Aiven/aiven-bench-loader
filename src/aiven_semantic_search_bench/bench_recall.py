@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -31,7 +32,7 @@ from .config import Settings
 from .corpus import load_corpus
 from .opensearch_client import KnnSpec, get_index_stats, get_opensearch_client
 from .report_context import benchmark_report_extras
-from .reporter import write_report
+from .reporter import raw_samples_enabled, write_report
 from .stats import percentiles_ms
 
 _QRELS_NAME = "qrels.npy"
@@ -132,6 +133,8 @@ def cmd_bench_recall(
     max_k = min(k, gt_k)
     recall_sums = {rk: 0.0 for rk in _RECALL_KS if rk <= max_k}
     latencies_ms: list[float] = []
+    save_raw = raw_samples_enabled()
+    raw_queries: list[dict[str, Any]] = []
 
     print(
         f"[bench-recall] Running {query_count} queries (k={k}, dim={embed_dim})..."
@@ -142,10 +145,27 @@ def cmd_bench_recall(
 
         t0 = time.perf_counter()
         retrieved = _knn_search_ids(client, settings.opensearch_index, vec, k=k)
-        latencies_ms.append((time.perf_counter() - t0) * 1000)
+        lat_ms = (time.perf_counter() - t0) * 1000
+        latencies_ms.append(lat_ms)
 
         for rk in recall_sums:
             recall_sums[rk] += _recall_at_k(retrieved, true_ids, rk)
+
+        if save_raw:
+            gt_ordered = [
+                idx_to_id[int(i)]
+                for i in true_row_indices
+                if int(i) in idx_to_id
+            ]
+            row: dict[str, Any] = {
+                "query_idx": q_idx,
+                "latency_ms": round(lat_ms, 3),
+                "retrieved_doc_ids": list(retrieved),
+                "ground_truth_doc_ids": gt_ordered,
+            }
+            for rk in recall_sums:
+                row[f"recall@{rk}"] = float(_recall_at_k(retrieved, true_ids, rk))
+            raw_queries.append(row)
 
     lat = percentiles_ms(latencies_ms)
     recall_results = {
@@ -179,7 +199,9 @@ def cmd_bench_recall(
         + "  ".join(f"{rk}={v:.3f}" for rk, v in recall_results.items())
     )
 
-    json_path, md_path = write_report(
+    raw_payload = {"queries": raw_queries} if save_raw and raw_queries else None
+
+    json_path, md_path, raw_path = write_report(
         "bench-recall",
         params={
             "plan_label":    label,
@@ -204,7 +226,10 @@ def cmd_bench_recall(
             f"k-NN spec: {knn.label()}",
         ],
         out_dir=out_dir,
+        raw_data=raw_payload,
     )
     print(f"[bench-recall] Wrote: {json_path}")
     print(f"[bench-recall] Wrote: {md_path}")
+    if raw_path:
+        print(f"[bench-recall] Wrote: {raw_path}")
     return 0

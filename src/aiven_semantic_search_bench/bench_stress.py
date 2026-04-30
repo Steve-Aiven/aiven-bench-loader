@@ -866,7 +866,7 @@ def cmd_bench_stress(
             print("[bench-stress] Thanos: no metrics returned (integration may still be catching up).")
 
     # ── Write report ───────────────────────────────────────────────────────
-    json_path, md_path = write_report(
+    json_path, md_path, _raw_path = write_report(
         "bench-stress",
         params={
             "plan_label":          label,

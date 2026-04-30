@@ -11,11 +11,15 @@ Every benchmark produces two artifacts:
 
 Both files share a timestamped filename so re-runs do not overwrite previous
 results. They live under `results/` by default (gitignored).
+
+Optional: set ``BENCH_SAVE_RAW_SAMPLES=1`` so benchmarks that support it also
+write a ``*-raw.json`` sidecar with per-request / per-query samples.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import platform
 import time
 from pathlib import Path
@@ -43,6 +47,7 @@ def _field_guide_markdown(bench_name: str) -> str:
 | **`deployment`** | *(When present)* Where the runner and target OpenSearch service run, plus **plan** and **cloud** when resolved via env vars or the Aiven API. |
 | **`preflight`** | *(When present)* Timings for repeated **HTTPS GET /** to the cluster **before** the benchmark (same URI/auth as the run). Surrogate for network + TLS + HTTP stack latency (not ICMP ping). |
 | **`field_guide`** | *(JSON only)* This section as a single string for programmatic consumers. |
+| **`raw_samples_file`** | *(When present)* Filename of **`*-raw.json`** in the same directory — full per-query or per-request samples. Enable with **`BENCH_SAVE_RAW_SAMPLES=1`**. |
 
 ### `deployment.loader` (benchmark runner)
 
@@ -94,13 +99,23 @@ def _field_guide_markdown(bench_name: str) -> str:
 _FIELD_GUIDE_DEFAULT = """_No extended guide for this benchmark name — interpret **`results`** using **`params`** and the command-line help for this command._"""
 
 
+def raw_samples_enabled() -> bool:
+    """When True, benchmarks may attach a ``*-raw.json`` sidecar via ``write_report``."""
+    v = os.environ.get("BENCH_SAVE_RAW_SAMPLES", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 _FIELD_GUIDE_BY_BENCH: dict[str, str] = {
     "bench-index": """**Extra params:** **`documents`** — docs indexed per batch-size sweep; **`batch_sizes`** — bulk `_bulk` sizes tested; **`embed_model`** — model id from the corpus manifest.
 
-**Results rows:** One row per **`batch_size`**. **`docs_per_sec`** is throughput for that sweep; **`p50_ms`** / **`p95_ms`** / etc. are latencies **per `_bulk` HTTP request** (network + OpenSearch). **`wall_seconds`** is total time for indexing all documents at that batch size. The index is reset between batch sizes.""",
+**Results rows:** One row per **`batch_size`**. **`docs_per_sec`** is throughput for that sweep; **`p50_ms`** / **`p95_ms`** / etc. are latencies **per `_bulk` HTTP request** (network + OpenSearch). **`wall_seconds`** is total time for indexing all documents at that batch size. The index is reset between batch sizes.
+
+**Raw sidecar:** With **`BENCH_SAVE_RAW_SAMPLES=1`**, **`*-raw.json`** holds each `_bulk` request’s latency and success flag per batch size.""",
     "bench-recall": """**Extra params:** **`doc_count`** — documents present in the index at recall time (from cluster stats); **`query_count`** — queries evaluated; **`k`** — k-NN **`k`** requested from OpenSearch; **`groundtruth_k`** — width of the brute-force neighbour lists in `qrels.npy`.
 
-**Results:** **`p*_ms`** — client-side round-trip latency per query. **`recall@1`**, **`recall@5`**, … — fraction of queries where **at least one** of the top-*K* ground-truth neighbour doc IDs appears in OpenSearch’s top-*K* hits (see **`notes`**). Low recall often means the index holds fewer docs than the corpus used to build ground truth.""",
+**Results:** **`p*_ms`** — client-side round-trip latency per query. **`recall@1`**, **`recall@5`**, … — fraction of queries where **at least one** of the top-*K* ground-truth neighbour doc IDs appears in OpenSearch’s top-*K* hits (see **`notes`**). Low recall often means the index holds fewer docs than the corpus used to build ground truth.
+
+**Raw sidecar:** With **`BENCH_SAVE_RAW_SAMPLES=1`**, a sibling **`*-raw.json`** lists every query’s latency, retrieved doc IDs, ground-truth IDs, and per-*K* recall indicators.""",
     "bench-search": """**Extra params:** **`mode`** — `rounds` (fixed rounds × queries) vs `sustained` (target throughput × duration); **`rounds`**, **`query_count`**, **`search_clients`** — concurrency layout; **`warmup_queries`** — queries discarded while stabilising p95; **`force_merge_segments`** — optional merge before measurement; **`target_throughput`** / **`time_period`** — sustained-mode caps.
 
 **Results:** In rounds mode, one row per measurement round plus optional aggregate; latencies are k-NN search round-trips. In sustained mode, summary rows include **`ops_per_sec`** and latency percentiles over all queries.""",
@@ -261,12 +276,16 @@ def write_report(
     out_dir: str | Path = "results",
     deployment: dict[str, Any] | None = None,
     preflight: dict[str, Any] | None = None,
-) -> tuple[Path, Path]:
+    raw_data: dict[str, Any] | None = None,
+) -> tuple[Path, Path, Path | None]:
     """
     Write JSON + Markdown reports under `out_dir/<name>-<timestamp>.{json,md}`.
 
-    Returns the (json_path, md_path) tuple so the CLI can print where each
-    artifact ended up.
+    When ``raw_data`` is not None, also writes ``<name>-<timestamp>-raw.json``
+    with detailed samples and sets ``raw_samples_file`` on the main JSON payload.
+
+    Returns ``(json_path, md_path, raw_json_path)`` — ``raw_json_path`` is None
+    when no sidecar was written.
     """
     notes = notes or []
     p = Path(out_dir)
@@ -274,6 +293,7 @@ def write_report(
     ts = time.strftime("%Y%m%d-%H%M%S")
     json_path = p / f"{name}-{ts}.json"
     md_path = p / f"{name}-{ts}.md"
+    raw_path: Path | None = None
 
     payload: dict[str, Any] = {
         "name": name,
@@ -287,6 +307,19 @@ def write_report(
     if preflight is not None:
         payload["preflight"] = preflight
     payload["field_guide"] = _field_guide_markdown(name)
+
+    if raw_data is not None:
+        raw_path = p / f"{name}-{ts}-raw.json"
+        raw_payload = {
+            "name": name,
+            "generated_at": payload["generated_at"],
+            "report_json": json_path.name,
+            "schema_version": 1,
+            "data": raw_data,
+        }
+        raw_path.write_text(json.dumps(raw_payload, indent=2))
+        payload["raw_samples_file"] = raw_path.name
+
     json_path.write_text(json.dumps(payload, indent=2))
     md_path.write_text(
         _render_markdown(
@@ -306,8 +339,8 @@ def write_report(
     try:
         from .clickhouse_sink import get_sink
 
-        get_sink().report_written(json_path, md_path)
+        get_sink().report_written(json_path, md_path, raw_path)
     except Exception:
         pass
 
-    return json_path, md_path
+    return json_path, md_path, raw_path

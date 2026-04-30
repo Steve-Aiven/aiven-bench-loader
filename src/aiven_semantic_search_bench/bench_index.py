@@ -29,6 +29,7 @@ OpenSearch + network RTT exclusively.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import numpy as np
 
@@ -37,7 +38,7 @@ from .config import Settings
 from .corpus import load_corpus
 from .opensearch_client import KnnSpec, get_opensearch_client, reset_index
 from .report_context import benchmark_report_extras
-from .reporter import write_report
+from .reporter import raw_samples_enabled, write_report
 from .stats import chunked, percentiles_ms, stopwatch
 
 _DEFAULT_SPEC = KnnSpec(embed_dim=768)
@@ -153,16 +154,22 @@ def cmd_bench_index(
     sink = get_sink()
 
     results: list[dict] = []
+    raw_bulk: dict[str, list[dict[str, Any]]] = {}
+    save_raw = raw_samples_enabled()
+
     for bs in batch_sizes:
         print(f"[bench-index] Resetting index and indexing at batch_size={bs}...")
         reset_index(client, settings.opensearch_index, spec=knn)
 
         bs_label = {"batch_size": str(bs)}
         request_latencies_ms: list[float] = []
+        bulk_samples: list[dict[str, Any]] = []
         bulk_failures = 0
+        req_idx = 0
         with stopwatch() as sw:
             for batch in chunked(payload, bs):
                 t0 = time.perf_counter()
+                ok_req = True
                 try:
                     _bulk_index_request(
                         client, settings.opensearch_index, batch, spec=knn
@@ -171,10 +178,23 @@ def cmd_bench_index(
                     request_latencies_ms.append(elapsed_ms)
                     sink.metric("index_bulk_ms", elapsed_ms, labels=bs_label)
                 except Exception:
+                    ok_req = False
                     elapsed_ms = (time.perf_counter() - t0) * 1000
                     request_latencies_ms.append(elapsed_ms)
                     bulk_failures += 1
                     sink.metric("bulk_failures_total", 1.0, labels=bs_label)
+                if save_raw:
+                    bulk_samples.append(
+                        {
+                            "request_index": req_idx,
+                            "latency_ms": round(elapsed_ms, 3),
+                            "ok": ok_req,
+                            "docs_in_batch": len(batch),
+                        }
+                    )
+                req_idx += 1
+        if save_raw:
+            raw_bulk[str(bs)] = bulk_samples
 
         client.indices.refresh(index=settings.opensearch_index)
         wall_s = sw["elapsed_s"]
@@ -206,7 +226,9 @@ def cmd_bench_index(
             + (f", FAILURES={bulk_failures}" if bulk_failures else "")
         )
 
-    json_path, md_path = write_report(
+    raw_payload = {"bulk_requests_by_batch_size": raw_bulk} if save_raw and raw_bulk else None
+
+    json_path, md_path, raw_path = write_report(
         "bench-index",
         params={
             "plan_label":    label,
@@ -232,7 +254,10 @@ def cmd_bench_index(
             f"Label '{label}' — re-run with a different label to compare configurations.",
         ],
         out_dir=out_dir,
+        raw_data=raw_payload,
     )
     print(f"[bench-index] Wrote: {json_path}")
     print(f"[bench-index] Wrote: {md_path}")
+    if raw_path:
+        print(f"[bench-index] Wrote: {raw_path}")
     return 0

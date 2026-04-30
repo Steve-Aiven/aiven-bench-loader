@@ -360,7 +360,7 @@ def cmd_bench_plan_change(
             f"p99={s['p99_ms']:>7.1f}ms"
         )
 
-    json_path, md_path = write_report(
+    json_path, md_path, _raw_path = write_report(
         "bench-plan-change",
         params={
             "plan_label":           label,

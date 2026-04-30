@@ -350,7 +350,10 @@ class ClickHouseSink:
         )
 
     def report_written(
-        self, json_path: Path | str, md_path: Path | str | None = None
+        self,
+        json_path: Path | str,
+        md_path: Path | str | None = None,
+        raw_path: Path | str | None = None,
     ) -> None:
         """Called by ``write_report``; remembers the JSON path for SSE result events."""
         with self._lock:
@@ -358,6 +361,8 @@ class ClickHouseSink:
         self.log("info", "report", f"Wrote report: {json_path}")
         if md_path:
             self.log("info", "report", f"Wrote markdown: {md_path}")
+        if raw_path:
+            self.log("info", "report", f"Wrote raw samples: {raw_path}")
 
     # ── Control plane ─────────────────────────────────────────────────────────
 

@@ -182,7 +182,7 @@ def cmd_bench_recover(
         f"Overhead: {cold_ms - warm_ms:.0f}ms"
     )
 
-    json_path, md_path = write_report(
+    json_path, md_path, _raw_path = write_report(
         "bench-recover",
         params={
             "plan_label":     label,

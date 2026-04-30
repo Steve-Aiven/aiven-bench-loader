@@ -284,7 +284,7 @@ def cmd_bench_hybrid(
         + ("  ".join(f"{rk}={v:.3f}" for rk, v in recall_results.items()) if recall_results else "")
     )
 
-    json_path, md_path = write_report(
+    json_path, md_path, _raw_path = write_report(
         "bench-hybrid",
         params={
             "plan_label":         label,
