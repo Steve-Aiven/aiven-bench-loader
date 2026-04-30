@@ -36,6 +36,7 @@ from .clickhouse_sink import get_sink
 from .config import Settings
 from .corpus import load_corpus
 from .opensearch_client import KnnSpec, get_opensearch_client, reset_index
+from .report_context import benchmark_report_extras
 from .reporter import write_report
 from .stats import chunked, percentiles_ms, stopwatch
 
@@ -106,6 +107,7 @@ def cmd_bench_index(
 
     uri = opensearch_uri or settings.opensearch_uri
     knn = spec or KnnSpec(embed_dim=embed_dim)
+    deployment_ctx, preflight_ctx = benchmark_report_extras(settings, uri)
 
     print(f"[bench-index] Loading corpus from {corpus_dir} at dim={embed_dim}...")
     bundle = load_corpus(corpus_dir, embed_dim)
@@ -218,6 +220,8 @@ def cmd_bench_index(
             "index":         settings.opensearch_index,
         },
         results=results,
+        deployment=deployment_ctx,
+        preflight=preflight_ctx,
         notes=[
             "Documents come from the pre-built corpus; embeddings are NOT recomputed at runtime.",
             "Latency is per `_bulk` HTTP request, including OpenSearch processing time.",

@@ -55,6 +55,7 @@ from .opensearch_client import (
     get_index_stats,
     get_opensearch_client,
 )
+from .report_context import benchmark_report_extras
 from .reporter import write_report
 from .stats import percentiles_ms
 
@@ -351,6 +352,7 @@ def cmd_bench_search(
 ) -> int:
     uri = opensearch_uri or settings.opensearch_uri
     knn = spec or KnnSpec(embed_dim=embed_dim)
+    deployment_ctx, preflight_ctx = benchmark_report_extras(settings, uri)
     client = get_opensearch_client(uri)
 
     if not client.indices.exists(index=settings.opensearch_index):
@@ -461,6 +463,8 @@ def cmd_bench_search(
             "force_merge_segments":  force_merge_segments,
         },
         results=results,
+        deployment=deployment_ctx,
+        preflight=preflight_ctx,
         notes=[
             "Queries are loaded from the pre-built corpus; embeddings are NOT recomputed.",
             "Latency is client-side round-trip including network to the Aiven service.",

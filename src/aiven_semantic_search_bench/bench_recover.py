@@ -39,6 +39,7 @@ import numpy as np
 from .config import Settings
 from .corpus import CorpusBundle, load_corpus
 from .opensearch_client import get_index_stats, get_opensearch_client, reset_index
+from .report_context import benchmark_report_extras
 from .reporter import write_report
 
 
@@ -118,6 +119,10 @@ def cmd_bench_recover(
     print(f"[bench-recover] Loading corpus from {corpus_dir} at dim={embed_dim}...")
     bundle = load_corpus(corpus_dir, embed_dim)
 
+    deployment_ctx, preflight_ctx = benchmark_report_extras(
+        settings, settings.opensearch_uri
+    )
+
     # Use a longer timeout - the first post-pause request may need to wait for
     # the service to finish waking up before it can respond.
     client = get_opensearch_client(settings.opensearch_uri, timeout=120)
@@ -190,6 +195,8 @@ def cmd_bench_recover(
             "corpus_dir":     corpus_dir,
         },
         results=results,
+        deployment=deployment_ctx,
+        preflight=preflight_ctx,
         notes=[
             f"Request 1 is the 'cold start' after {idle_minutes} minutes of inactivity.",
             "Requests 2 and 3 show how quickly the service recovers once woken.",

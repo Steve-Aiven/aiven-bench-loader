@@ -21,7 +21,6 @@ against the same index.  The ``--embed-dim`` and ``--k`` must match.
 
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 
@@ -31,6 +30,7 @@ from .clickhouse_sink import get_sink
 from .config import Settings
 from .corpus import load_corpus
 from .opensearch_client import KnnSpec, get_index_stats, get_opensearch_client
+from .report_context import benchmark_report_extras
 from .reporter import write_report
 from .stats import percentiles_ms
 
@@ -86,6 +86,7 @@ def cmd_bench_recall(
 ) -> int:
     uri = opensearch_uri or settings.opensearch_uri
     knn = spec or KnnSpec(embed_dim=embed_dim)
+    deployment_ctx, preflight_ctx = benchmark_report_extras(settings, uri)
     client = get_opensearch_client(uri)
 
     if not client.indices.exists(index=settings.opensearch_index):
@@ -193,6 +194,8 @@ def cmd_bench_recall(
             "groundtruth_k": int(gt_k),
         },
         results=[result_row],
+        deployment=deployment_ctx,
+        preflight=preflight_ctx,
         notes=[
             "recall@K = fraction of queries where at least one of the K ground-truth "
             "nearest neighbours appears in the OpenSearch top-K results.",

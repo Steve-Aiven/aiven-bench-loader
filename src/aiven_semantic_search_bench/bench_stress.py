@@ -52,6 +52,7 @@ from .opensearch_client import (
     get_index_stats,
     get_opensearch_client,
 )
+from .report_context import benchmark_report_extras
 from .reporter import write_report
 from .stats import percentiles_ms
 
@@ -522,9 +523,15 @@ def cmd_bench_stress(
 ) -> int:
     uri = opensearch_uri or settings.opensearch_uri
     knn = spec or KnnSpec(embed_dim=embed_dim)
+    deployment_ctx, preflight_ctx = benchmark_report_extras(
+        settings,
+        uri,
+        aiven_api_token=aiven_api_token or None,
+        aiven_project=aiven_project or None,
+    )
     admin_client = get_opensearch_client(uri, timeout=30)
 
-    # ── Preflight ──────────────────────────────────────────────────────────
+    # ── Index readiness ───────────────────────────────────────────────────
     if not admin_client.indices.exists(index=settings.opensearch_index):
         print(
             f"[bench-stress] ERROR: index '{settings.opensearch_index}' does not exist.\n"
@@ -881,6 +888,8 @@ def cmd_bench_stress(
             "thanos_metrics":      thanos_data if thanos_data else None,
         },
         results=results,
+        deployment=deployment_ctx,
+        preflight=preflight_ctx,
         notes=[
             "Stress test: concurrent bulk-indexing + k-NN search, no rate limit.",
             f"{index_clients} index thread(s) × batch_size={batch_size}, "

@@ -39,6 +39,7 @@ from .aiven_client import AivenClient
 from .config import Settings
 from .corpus import CorpusBundle, load_corpus
 from .opensearch_client import get_index_stats, get_opensearch_client, reset_index
+from .report_context import benchmark_report_extras
 from .reporter import write_report
 from .stats import percentiles_ms
 
@@ -295,6 +296,13 @@ def cmd_bench_plan_change(
     print(f"[bench-plan-change] Loading corpus from {corpus_dir} at dim={embed_dim}...")
     bundle = load_corpus(corpus_dir, embed_dim)
 
+    deployment_ctx, preflight_ctx = benchmark_report_extras(
+        settings,
+        settings.opensearch_uri,
+        aiven_api_token=settings.aiven_api_token,
+        aiven_project=settings.aiven_project,
+    )
+
     client = get_opensearch_client(settings.opensearch_uri, timeout=120)
     seeded_doc_count = _ensure_seeded(client, settings, bundle, doc_count, embed_dim)
 
@@ -371,6 +379,8 @@ def cmd_bench_plan_change(
             "timeline":             timeline,
         },
         results=summaries,
+        deployment=deployment_ctx,
+        preflight=preflight_ctx,
         notes=[
             f"Phase 'during_migration_to_{to_plan}' includes the full Aiven rebalance window.",
             "Errors and elevated p95 in the 'during_migration' row are the upgrade tax.",

@@ -40,6 +40,7 @@ from .clickhouse_sink import get_sink
 from .config import Settings
 from .corpus import load_corpus
 from .opensearch_client import KnnSpec, get_index_stats, get_opensearch_client
+from .report_context import benchmark_report_extras
 from .reporter import write_report
 from .stats import percentiles_ms
 
@@ -153,6 +154,7 @@ def cmd_bench_hybrid(
 ) -> int:
     uri = opensearch_uri or settings.opensearch_uri
     knn = spec or KnnSpec(embed_dim=embed_dim, with_text=True, with_metadata=True)
+    deployment_ctx, preflight_ctx = benchmark_report_extras(settings, uri)
     client = get_opensearch_client(uri)
 
     if not client.indices.exists(index=settings.opensearch_index):
@@ -299,6 +301,8 @@ def cmd_bench_hybrid(
             "corpus_dir":         corpus_dir,
         },
         results=[result_row],
+        deployment=deployment_ctx,
+        preflight=preflight_ctx,
         notes=[
             f"Hybrid mode: {query_mode}",
             f"Filter selectivity: {filter_selectivity} (category={filter_category!r})",
