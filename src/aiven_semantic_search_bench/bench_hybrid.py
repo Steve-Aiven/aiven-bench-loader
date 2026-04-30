@@ -186,7 +186,7 @@ def cmd_bench_hybrid(
         qrels = np.load(str(qrels_path))
         docs_df = pd.read_parquet(Path(corpus_dir) / "docs.parquet")
         docs_df = docs_df.iloc[:int(doc_count)]
-        idx_to_id = {i: str(row["doc_id"]) for i, row in enumerate(docs_df.itertuples())}
+        idx_to_id = dict(enumerate(docs_df["doc_id"].astype(str)))
         gt_k = qrels.shape[1]
     else:
         print("[bench-hybrid] qrels.npy not found — recall will not be computed.")

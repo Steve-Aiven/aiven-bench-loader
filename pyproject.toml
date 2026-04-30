@@ -19,6 +19,16 @@ Homepage = "https://github.com/aiven/aiven-semantic-search-bench"
 Repository = "https://github.com/aiven/aiven-semantic-search-bench"
 Orchestrator = "https://github.com/aiven/aiven-bench-orchestrator"
 
+[project.scripts]
+bench-build-corpus = "aiven_semantic_search_bench.cli:main_bench_build_corpus"
+bench-build-groundtruth = "aiven_semantic_search_bench.cli:main_bench_build_groundtruth"
+bench-index = "aiven_semantic_search_bench.cli:main_bench_index"
+bench-search = "aiven_semantic_search_bench.cli:main_bench_search"
+bench-recall = "aiven_semantic_search_bench.cli:main_bench_recall"
+bench-hybrid = "aiven_semantic_search_bench.cli:main_bench_hybrid"
+bench-recover = "aiven_semantic_search_bench.cli:main_bench_recover"
+bench-plan-change = "aiven_semantic_search_bench.cli:main_bench_plan_change"
+
 [project.optional-dependencies]
 # pip install -e '.[build]' — everything needed to build the embedding corpus locally.
 # On Mac Apple Silicon this picks up MPS automatically via the default torch wheel.
@@ -26,6 +36,8 @@ build = [
     "sentence-transformers>=3.0,<4",
     "datasets>=3.0,<5",
     "pyarrow>=15",
+    # Required by nomic-ai/nomic-embed-text-v1.5 (transformers dynamic module import).
+    "einops>=0.7",
 ]
 # pip install -e '.[ui]' — the NiceGUI standalone dashboard + charting libs.
 ui = [

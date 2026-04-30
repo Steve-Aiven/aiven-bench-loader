@@ -9,7 +9,9 @@ deployed as an Aiven Application (LOADER_MODE=1).
 
 Endpoints
 ---------
-POST  /run               — submit a benchmark job (SSE log stream + result)
+POST  /run               — submit a benchmark job (SSE log stream + result).
+                           Optional: omit or null ``embed_dim``, ``doc_count``, ``query_count``
+                           to use values from the loaded corpus (GET /corpus/status).
 POST  /cancel/{job_id}   — cancel a running job
 POST  /corpus/build      — build the corpus on this machine (SSE progress)
 POST  /corpus/upload     — upload a pre-built corpus as a .tar.gz archive
@@ -95,6 +97,53 @@ def _require_auth(
 
 _corpus_lock = threading.Lock()
 _corpus_state: dict[str, Any] = {"state": "missing"}  # in-memory corpus metadata
+
+
+def _resolve_job_spec_with_corpus(spec: JobSpec) -> JobSpec:
+    """Fill ``embed_dim`` / ``doc_count`` / ``query_count`` from the ready corpus when omitted."""
+    with _corpus_lock:
+        if _corpus_state.get("state") != "ready":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Corpus not ready. Submit POST /corpus/build first.",
+            )
+        c_embed = _corpus_state.get("embed_dim")
+        c_docs = _corpus_state.get("doc_count")
+        c_queries = _corpus_state.get("query_count")
+
+    embed_dim = spec.embed_dim if spec.embed_dim is not None else c_embed
+    doc_count = spec.doc_count if spec.doc_count is not None else c_docs
+    query_count = spec.query_count if spec.query_count is not None else c_queries
+
+    missing = [
+        name
+        for name, val in (
+            ("embed_dim", embed_dim),
+            ("doc_count", doc_count),
+            ("query_count", query_count),
+        )
+        if val is None
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Cannot resolve job fields {missing!r} from corpus metadata. "
+                f"Pass them explicitly in the request body or reload the corpus (GET /corpus/status)."
+            ),
+        )
+    if int(doc_count) <= 0 or int(query_count) <= 0 or int(embed_dim) <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Resolved doc_count, query_count, and embed_dim must be positive.",
+        )
+    return spec.model_copy(
+        update={
+            "embed_dim": int(embed_dim),
+            "doc_count": int(doc_count),
+            "query_count": int(query_count),
+        }
+    )
 
 
 def _corpus_status_obj() -> CorpusStatus:
@@ -483,6 +532,10 @@ def _dispatch_job(
             return
 
         _log(f"[loader] Starting {bench_type} job {spec.job_id}")
+        _log(
+            f"[loader] workload embed_dim={spec.embed_dim} "
+            f"doc_count={spec.doc_count} query_count={spec.query_count}"
+        )
 
         if bench_type == "index":
             from aiven_semantic_search_bench.bench_index import cmd_bench_index
@@ -752,13 +805,7 @@ _logger = logging.getLogger(__name__)
 @app.post("/run", dependencies=[Depends(_require_auth)])
 async def run_job(spec: JobSpec) -> EventSourceResponse:
     """Submit a benchmark job; stream logs + result as SSE."""
-    with _corpus_lock:
-        corpus_ready = _corpus_state.get("state") == "ready"
-    if not corpus_ready:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Corpus not ready. Submit POST /corpus/build first.",
-        )
+    spec = _resolve_job_spec_with_corpus(spec)
 
     import asyncio
     import queue as q_module

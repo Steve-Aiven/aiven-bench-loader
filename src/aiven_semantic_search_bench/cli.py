@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 from .bench_index import cmd_bench_index
 from .bench_plan_change import cmd_bench_plan_change
@@ -444,3 +445,45 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     raise RuntimeError(f"Unhandled command: {args.command}")
+
+
+def _main_console_script(command: str) -> int:
+    """Entry point for setuptools `[project.scripts]` wrappers.
+
+    Installed scripts invoke us with ``sys.argv == [script_path, <user args>]``;
+    :func:`argparse` expects the subcommand name as ``argv[1]``.
+    """
+    sys.argv.insert(1, command)
+    return main()
+
+
+def main_bench_build_corpus() -> int:
+    return _main_console_script("bench-build-corpus")
+
+
+def main_bench_build_groundtruth() -> int:
+    return _main_console_script("bench-build-groundtruth")
+
+
+def main_bench_index() -> int:
+    return _main_console_script("bench-index")
+
+
+def main_bench_search() -> int:
+    return _main_console_script("bench-search")
+
+
+def main_bench_recall() -> int:
+    return _main_console_script("bench-recall")
+
+
+def main_bench_hybrid() -> int:
+    return _main_console_script("bench-hybrid")
+
+
+def main_bench_recover() -> int:
+    return _main_console_script("bench-recover")
+
+
+def main_bench_plan_change() -> int:
+    return _main_console_script("bench-plan-change")
