@@ -112,6 +112,38 @@ def _best_device() -> str:
     return "cpu"
 
 
+def _resolve_device(explicit: str | None) -> str:
+    """
+    Pick embedding device: honour ``explicit`` (from ``HF_EMBED_DEVICE`` / ctor),
+    else auto-detect. Raises if user forces a device that is not available.
+    """
+    raw = (explicit or "").strip().lower()
+    if not raw:
+        return _best_device()
+    if raw not in ("cuda", "mps", "cpu"):
+        raise ValueError(
+            f"Invalid device {explicit!r}; use cuda, mps, cpu, or leave unset for auto."
+        )
+    import torch
+
+    if raw == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "HF_EMBED_DEVICE=cuda was set but CUDA is not available."
+            )
+        return "cuda"
+    if raw == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError(
+                "HF_EMBED_DEVICE=mps was set but MPS is not available. "
+                "Use native Apple Silicon Python (arm64), PyTorch built with MPS, "
+                "and run outside Linux containers on Mac (Docker Desktop typically "
+                "has no GPU)."
+            )
+        return "mps"
+    return "cpu"
+
+
 def _optimal_batch_size(device: str) -> int:
     """Larger batches saturate GPU/MPS faster; smaller batches avoid OOM on CPU."""
     if device == "cuda":
@@ -166,7 +198,7 @@ class HfEmbedder:
         import os
         from sentence_transformers import SentenceTransformer
 
-        self._device = self.device if self.device else _best_device()
+        self._device = _resolve_device(self.device)
         self._batch_size = self.batch_size if self.batch_size else _optimal_batch_size(self._device)
 
         # Tune PyTorch CPU thread count when running on CPU so we use all cores.

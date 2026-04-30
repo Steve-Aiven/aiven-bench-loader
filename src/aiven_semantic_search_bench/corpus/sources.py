@@ -13,6 +13,10 @@ We intentionally do NOT use qrels (relevance judgments). This benchmarking
 suite measures latency and throughput, not retrieval quality, so we just
 need diverse text to embed and search with.
 
+By default we stream datasets (small disk footprint; Hub traffic each build).
+Set ``BENCH_HF_DATASETS_STREAMING=0`` and a persistent ``HF_HOME`` (see
+``.env.example``) to cache full splits locally after the first download.
+
 The "mixed" preset draws ~25% from each of four sources, with deficits
 rolled over to MS MARCO (the only source with >100k queries), so the
 target counts are always achievable.
@@ -20,7 +24,7 @@ target counts are always achievable.
 
 from __future__ import annotations
 
-import random
+import os
 from dataclasses import dataclass
 
 # 768 is the output dimensionality of nomic-ai/nomic-embed-text-v1.5
@@ -34,7 +38,9 @@ from dataclasses import dataclass
 # SUPPORTED_DIMS tuple is read from the corpus manifest at load time so older
 # corpora continue to work at their original dimensions.
 MAX_DIM = 768
-SUPPORTED_DIMS: tuple[int, ...] = (256, 512, 768)
+# Includes larger dims for Vertex ``gemini-embedding-001`` (up to 3072). Load
+# time still validates against each corpus manifest's ``supported_dims``.
+SUPPORTED_DIMS: tuple[int, ...] = (256, 512, 768, 1024, 1536, 3072)
 
 
 @dataclass(frozen=True)
@@ -143,20 +149,31 @@ def _sample_one(
     if n <= 0:
         return []
 
-    from datasets import load_dataset
+    from datasets import DownloadMode, load_dataset
 
     config = source.docs_config if kind == "docs" else source.queries_config
     split = source.docs_split if kind == "docs" else source.queries_split
     fields = source.docs_text_fields if kind == "docs" else source.queries_text_fields
 
-    # buffer_size controls how much we shuffle. Larger = more random but
-    # requires downloading more data before the first row is emitted.
-    # 10 000 is a good balance: randomises well for typical benchmarks and
-    # only downloads ~10 k rows before we start receiving output.
-    buffer_size = min(10_000, n * 3)
+    # Streaming (default): low first-run disk use but hits the Hub on each build.
+    # Non-streaming: first run downloads into HF_HOME/HF_DATASETS_CACHE; later runs
+    # reuse the Arrow cache (set BENCH_HF_DATASETS_STREAMING=0). Large corpora
+    # (e.g. MS MARCO) need substantial disk once, then stay local.
+    raw = os.environ.get("BENCH_HF_DATASETS_STREAMING", "1").strip().lower()
+    streaming = raw not in ("0", "false", "no", "off")
 
-    ds = load_dataset(source.hf_path, config, split=split, streaming=True)
-    ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
+    load_kw: dict = {"streaming": streaming}
+    if not streaming:
+        load_kw["download_mode"] = DownloadMode.REUSE_CACHE_IF_EXISTS
+
+    ds = load_dataset(source.hf_path, config, split=split, **load_kw)
+
+    # buffer_size applies only to streaming shuffle.
+    buffer_size = min(10_000, n * 3)
+    if streaming:
+        ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
+    else:
+        ds = ds.shuffle(seed=seed)
 
     out: list[SampledRow] = []
     for i, row in enumerate(ds):

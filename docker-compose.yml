@@ -35,8 +35,8 @@ services:
     environment:
       # Results dir is read by both the dashboard and the runner thread.
       RESULTS_DIR: /app/results
-      # HuggingFace model + dataset cache — avoids re-downloading model
-      # weights and MS MARCO (~270 MB + ~3 GB) on every corpus build.
+      # HuggingFace model + dataset cache — persists weights and (when
+      # BENCH_HF_DATASETS_STREAMING=0 in .env) full BeIR Arrow shards under ./.hf-cache.
       HF_HOME: /home/bench/.cache/huggingface
       # Set LOADER_MODE=1 (and LOADER_API_KEY) in .env to expose the FastAPI
       # loader shim instead of the standalone NiceGUI dashboard.

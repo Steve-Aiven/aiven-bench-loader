@@ -18,6 +18,13 @@ What's required and when
   models.  Open models like nomic-embed-text-v1.5 work without it.
 - ``HF_EMBED_MAX_DIM`` — maximum embedding dimension to store in the corpus
   (default 768, matching the nomic model output).
+- ``HF_EMBED_DEVICE`` — optional: ``mps`` (Apple GPU), ``cuda``, or ``cpu``.
+  When unset, auto-detects (CUDA, then MPS on Apple Silicon, else CPU).
+- ``CORPUS_EMBED_BACKEND`` — ``hf`` (default), ``gemini`` (Google AI Studio API
+  key), or ``vertex`` (Vertex AI embeddings via ADC — matches GCP console billing).
+- ``GEMINI_API_KEY`` / ``GEMINI_EMBED_MODEL`` — used when backend is ``gemini``.
+- ``GCP_PROJECT_ID`` (or ``GOOGLE_CLOUD_PROJECT``), ``GCP_LOCATION``,
+  ``VERTEX_EMBED_MODEL`` — used when backend is ``vertex``.
 - ``EMBED_DIM`` — the dimension used at benchmark time (must be ≤
   ``HF_EMBED_MAX_DIM``; Matryoshka-truncated from the stored max).
 - ``AIVEN_API_TOKEN / PROJECT / SERVICE_NAME`` — optional; only needed by
@@ -38,6 +45,13 @@ class Settings:
     hf_embed_model: str
     hf_token: str               # empty string = no token (open models)
     hf_embed_max_dim: int
+    hf_embed_device: str  # "" = auto (cuda > mps > cpu)
+    corpus_embed_backend: str  # hf | gemini | vertex
+    gemini_api_key: str
+    gemini_embed_model: str
+    gcp_project_id: str
+    gcp_location: str
+    vertex_embed_model: str
     embed_dim: int
     # Aiven REST API — only required for bench-plan-change CLI command.
     aiven_api_token: str
@@ -54,6 +68,22 @@ class Settings:
             ),
             hf_token=os.environ.get("HF_TOKEN", ""),
             hf_embed_max_dim=int(os.environ.get("HF_EMBED_MAX_DIM", "768")),
+            hf_embed_device=os.environ.get("HF_EMBED_DEVICE", "").strip(),
+            corpus_embed_backend=os.environ.get(
+                "CORPUS_EMBED_BACKEND", "hf"
+            ).strip().lower(),
+            gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
+            gemini_embed_model=os.environ.get(
+                "GEMINI_EMBED_MODEL", "models/text-embedding-004"
+            ).strip(),
+            gcp_project_id=(
+                os.environ.get("GCP_PROJECT_ID", "").strip()
+                or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+            ),
+            gcp_location=os.environ.get("GCP_LOCATION", "us-central1").strip(),
+            vertex_embed_model=os.environ.get(
+                "VERTEX_EMBED_MODEL", "gemini-embedding-001"
+            ).strip(),
             embed_dim=int(os.environ.get("EMBED_DIM", "768")),
             aiven_api_token=os.environ.get("AIVEN_API_TOKEN", ""),
             aiven_project=os.environ.get("AIVEN_PROJECT", ""),

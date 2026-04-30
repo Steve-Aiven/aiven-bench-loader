@@ -2,9 +2,10 @@
 Build a benchmark corpus offline.
 
 End-to-end: sample text from public IR datasets, embed every text once using
-a local sentence-transformers model, persist parquet + npy + manifest. The
-model runs fully locally — no API key, no billing account, no network call
-after the one-time weight download.
+either a local sentence-transformers model or (optional) remote Google embeddings
+(Gemini API key or Vertex AI with ADC), then persist parquet + npy + manifest.
+Local HF runs need a one-time weight download; remote backends bill per cloud
+pricing.
 
 Resume support means a build can survive an interruption (e.g. laptop sleep)
 without losing all progress: if the .npy file already has the expected shape
@@ -20,8 +21,10 @@ cache; subsequent runs are fully offline.  CPU throughput is roughly
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -73,10 +76,25 @@ def build_corpus(
 
     max_dim = settings.hf_embed_max_dim
 
+    backend = (settings.corpus_embed_backend or "hf").strip().lower()
+    if backend not in ("hf", "gemini", "vertex"):
+        print(
+            f"[build-corpus] ERROR: unknown CORPUS_EMBED_BACKEND={backend!r} "
+            f"(use hf, gemini, or vertex)."
+        )
+        return 1
+
+    _model_disp = (
+        settings.vertex_embed_model
+        if backend == "vertex"
+        else settings.gemini_embed_model
+        if backend == "gemini"
+        else settings.hf_embed_model
+    )
     print(
         f"[build-corpus] preset={preset}  target_docs={target_docs}  "
         f"target_queries={target_queries}  out_dir={out_dir}  "
-        f"model={settings.hf_embed_model}  max_dim={max_dim}"
+        f"backend={backend}  model={_model_disp}  max_dim={max_dim}"
     )
 
     print("[build-corpus] Sampling text from Hugging Face datasets...")
@@ -110,12 +128,47 @@ def build_corpus(
         print("[build-corpus] dry_run=True — skipping embedding and manifest write.")
         return 0
 
-    embedder = HfEmbedder(
-        model_name=settings.hf_embed_model,
-        max_dim=max_dim,
-        hf_token=settings.hf_token or None,
-        batch_size=embed_batch_size,
-    )
+    if backend == "gemini":
+        if not settings.gemini_api_key:
+            print(
+                "[build-corpus] ERROR: CORPUS_EMBED_BACKEND=gemini requires GEMINI_API_KEY."
+            )
+            return 1
+        from ..gemini_embedder import GeminiCorpusEmbedder
+
+        pause_s = float(os.environ.get("GEMINI_EMBED_PAUSE_S", "0") or "0")
+        embedder = GeminiCorpusEmbedder(
+            api_key=settings.gemini_api_key,
+            model_name=settings.gemini_embed_model or "models/text-embedding-004",
+            max_dim=max_dim,
+            request_pause_s=pause_s,
+        )
+    elif backend == "vertex":
+        if not settings.gcp_project_id:
+            print(
+                "[build-corpus] ERROR: CORPUS_EMBED_BACKEND=vertex requires "
+                "GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT."
+            )
+            return 1
+        from ..vertex_embedder import VertexCorpusEmbedder
+
+        pause_s = float(os.environ.get("VERTEX_EMBED_PAUSE_S", "0") or "0")
+        embedder = VertexCorpusEmbedder(
+            project_id=settings.gcp_project_id,
+            location=settings.gcp_location or "us-central1",
+            model_name=settings.vertex_embed_model or "gemini-embedding-001",
+            max_dim=max_dim,
+            request_pause_s=pause_s,
+        )
+    else:
+        _dev = settings.hf_embed_device.strip() if settings.hf_embed_device else None
+        embedder = HfEmbedder(
+            model_name=settings.hf_embed_model,
+            max_dim=max_dim,
+            hf_token=settings.hf_token or None,
+            batch_size=embed_batch_size,
+            device=_dev,
+        )
 
     docs_vecs = _embed_phase_with_resume(
         embedder=embedder,
@@ -158,7 +211,14 @@ def build_corpus(
         "actual_queries":   int(len(queries_df)),
         "source_dim":       actual_dim,
         "supported_dims":   sorted(supported),
-        "embed_model":      settings.hf_embed_model,
+        "embed_model": (
+            settings.vertex_embed_model
+            if backend == "vertex"
+            else settings.gemini_embed_model
+            if backend == "gemini"
+            else settings.hf_embed_model
+        ),
+        "embed_backend":    backend,
         "embed_batch_size": int(embed_batch_size),
         "seed":             int(seed),
         "has_metadata":     with_metadata,
@@ -173,7 +233,7 @@ def build_corpus(
 
 def _embed_phase_with_resume(
     *,
-    embedder: HfEmbedder,
+    embedder: Any,
     kind: str,
     texts: list[str],
     batch_size: int,
@@ -204,7 +264,7 @@ def _embed_phase_with_resume(
 
 def _embed_phase(
     *,
-    embedder: HfEmbedder,
+    embedder: Any,
     kind: str,
     texts: list[str],
     batch_size: int,

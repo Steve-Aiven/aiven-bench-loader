@@ -494,6 +494,22 @@ def _dispatch_job(
         hf_embed_model="",
         hf_token="",
         hf_embed_max_dim=spec.embed_dim,
+        hf_embed_device=os.environ.get("HF_EMBED_DEVICE", "").strip(),
+        corpus_embed_backend=os.environ.get(
+            "CORPUS_EMBED_BACKEND", "hf"
+        ).strip().lower(),
+        gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
+        gemini_embed_model=os.environ.get(
+            "GEMINI_EMBED_MODEL", "models/text-embedding-004"
+        ).strip(),
+        gcp_project_id=(
+            os.environ.get("GCP_PROJECT_ID", "").strip()
+            or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+        ),
+        gcp_location=os.environ.get("GCP_LOCATION", "us-central1").strip(),
+        vertex_embed_model=os.environ.get(
+            "VERTEX_EMBED_MODEL", "gemini-embedding-001"
+        ).strip(),
         embed_dim=spec.embed_dim,
         aiven_api_token=(spec.aiven_api_token or ""),
         aiven_project=(spec.aiven_project or ""),
@@ -703,7 +719,23 @@ def _run_corpus_build(config: CorpusConfig, queue: "queue_module.Queue") -> None
         opensearch_index="",
         hf_embed_model=hf_model,
         hf_token=hf_token,
-        hf_embed_max_dim=768,
+        hf_embed_max_dim=int(os.environ.get("HF_EMBED_MAX_DIM", "768")),
+        hf_embed_device=os.environ.get("HF_EMBED_DEVICE", "").strip(),
+        corpus_embed_backend=os.environ.get(
+            "CORPUS_EMBED_BACKEND", "hf"
+        ).strip().lower(),
+        gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
+        gemini_embed_model=os.environ.get(
+            "GEMINI_EMBED_MODEL", "models/text-embedding-004"
+        ).strip(),
+        gcp_project_id=(
+            os.environ.get("GCP_PROJECT_ID", "").strip()
+            or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+        ),
+        gcp_location=os.environ.get("GCP_LOCATION", "us-central1").strip(),
+        vertex_embed_model=os.environ.get(
+            "VERTEX_EMBED_MODEL", "gemini-embedding-001"
+        ).strip(),
         embed_dim=768,
         aiven_api_token="",
         aiven_project="",

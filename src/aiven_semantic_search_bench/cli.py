@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import replace
 
 from .bench_index import cmd_bench_index
 from .bench_plan_change import cmd_bench_plan_change
@@ -59,8 +60,9 @@ def _add_corpus_args(sp: argparse.ArgumentParser) -> None:
         choices=list(SUPPORTED_DIMS),
         default=None,
         help=(
-            f"Embedding dimension at load time (Matryoshka-truncated from 3072). "
-            f"Choices: {list(SUPPORTED_DIMS)}. Defaults to EMBED_DIM env var."
+            f"Embedding dimension at benchmark load time (prefix slice + renorm "
+            f"when the corpus supports it). Choices: {list(SUPPORTED_DIMS)}. "
+            f"Defaults to EMBED_DIM env var."
         ),
     )
     sp.add_argument(
@@ -189,6 +191,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Add synthetic category/tenant_id/created_at columns to docs.parquet",
+    )
+    sp.add_argument(
+        "--embed-backend",
+        choices=("hf", "gemini", "vertex"),
+        default=None,
+        help=(
+            "Embedding backend (overrides CORPUS_EMBED_BACKEND). "
+            "vertex/gemini avoid local HF/MPS load; still uses env for API keys / GCP project."
+        ),
     )
 
     # ── bench-build-groundtruth ──────────────────────────────────────────────
@@ -319,6 +330,11 @@ def main(argv: list[str] | None = None) -> int:
     settings = Settings.from_env()
 
     if args.command == "bench-build-corpus":
+        if args.embed_backend:
+            settings = replace(
+                settings,
+                corpus_embed_backend=str(args.embed_backend).strip().lower(),
+            )
         return build_corpus(
             settings=settings,
             out_dir=str(args.out_dir),

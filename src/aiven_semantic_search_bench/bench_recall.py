@@ -64,7 +64,7 @@ def _load_doc_id_map(corpus_dir: str, doc_count: int) -> dict[int, str]:
     import pandas as pd
     docs_df = pd.read_parquet(Path(corpus_dir) / "docs.parquet")
     docs_df = docs_df.iloc[:doc_count]
-    return {i: str(row["doc_id"]) for i, row in enumerate(docs_df.itertuples())}
+    return dict(enumerate(docs_df["doc_id"].astype(str)))
 
 
 def _recall_at_k(retrieved_ids: list[str], true_ids: set[str], k: int) -> float:

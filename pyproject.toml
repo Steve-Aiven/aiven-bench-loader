@@ -39,6 +39,14 @@ build = [
     # Required by nomic-ai/nomic-embed-text-v1.5 (transformers dynamic module import).
     "einops>=0.7",
 ]
+# pip install -e '.[build-gemini]' — google-generativeai only (use with CORPUS_EMBED_BACKEND=gemini).
+build-gemini = [
+    "google-generativeai>=0.8,<1",
+]
+# pip install -e '.[build-vertex]' — Vertex AI SDK (ADC); CORPUS_EMBED_BACKEND=vertex.
+build-vertex = [
+    "google-cloud-aiplatform>=1.75,<2",
+]
 # pip install -e '.[ui]' — the NiceGUI standalone dashboard + charting libs.
 ui = [
     "nicegui>=1.4",
@@ -55,7 +63,7 @@ loader = [
 ]
 # pip install -e '.[dev]' — everything needed for local development (corpus + UI + loader).
 dev = [
-    "aiven-semantic-search-bench[build,ui,loader]",
+    "aiven-semantic-search-bench[build,build-gemini,build-vertex,ui,loader]",
 ]
 
 [tool.setuptools]
