@@ -179,11 +179,13 @@ def _run_rounds(
         ]
 
         def _worker(vecs: np.ndarray) -> None:
+            local_lats: list[float] = []
             for v in vecs:
                 t0 = time.perf_counter()
                 _knn_search(client, index, v, k=k, ef_search=ef_search, data_type=data_type)
-                with lock:
-                    round_lats.append((time.perf_counter() - t0) * 1000)
+                local_lats.append((time.perf_counter() - t0) * 1000)
+            with lock:
+                round_lats.extend(local_lats)
 
         with ThreadPoolExecutor(max_workers=search_clients) as pool:
             futs = [pool.submit(_worker, chunk) for chunk in chunks]
