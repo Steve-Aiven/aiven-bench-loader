@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: Aiven Bench Loader API
-  version: "1.1.0"
+  version: "1.2.0"
   description: |
     Benchmark execution engine deployed as an Aiven Application.
 
@@ -33,8 +33,19 @@ info:
     | `CLICKHOUSE_PASSWORD` | `…` |
     | `CLICKHOUSE_DATABASE` | `bench` (default) |
 
+    For local development, run `docker compose -f docker-compose.clickhouse.yml up -d`
+    and point the env vars at `http://localhost:8123`.
+
     The **schema is owned by the orchestrator** (see `clickhouse/schema.sql`).
     The loader only inserts rows and reads `bench_control` for live directives.
+
+    ## Raw Sample Sidecars
+    Set `BENCH_SAVE_RAW_SAMPLES=1` to write a `*-raw.json` sidecar alongside
+    every report. Each sidecar contains per-query samples including:
+    - `ts` — UTC ISO-8601 wall-clock timestamp at query dispatch (for spike correlation).
+    - `latency_ms` — client-side round-trip in milliseconds.
+    - `query_idx`, `round` (bench-search and bench-recall).
+    - `retrieved_doc_ids`, `ground_truth_doc_ids`, `recall@K` (bench-recall only).
 
     ### Tables written by the loader
 
@@ -258,7 +269,10 @@ components:
         search_clients:
           type: integer
           default: 1
-          description: Parallel search worker threads (`bench_type=search`).
+          description: |
+            Parallel search worker threads. Applies to both `bench_type=search` and
+            `bench_type=recall`. Raising this value tests recall accuracy and latency
+            under concurrent load. Default 1 gives the cleanest serial baseline.
         target_throughput:
           type: number
           format: float

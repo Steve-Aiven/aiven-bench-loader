@@ -47,10 +47,18 @@ run() {
 
 # _docker_bench <bench-command> [extra flags...]
 # Runs a single bench command inside the lean container.
+# ClickHouse telemetry and raw-sample env vars are forwarded when set.
 _docker_bench() {
   local cmd="$1"; shift
+  local ch_flags=()
+  [[ -n "${CLICKHOUSE_URL:-}" ]]      && ch_flags+=(-e "CLICKHOUSE_URL=$CLICKHOUSE_URL")
+  [[ -n "${CLICKHOUSE_USER:-}" ]]     && ch_flags+=(-e "CLICKHOUSE_USER=$CLICKHOUSE_USER")
+  [[ -n "${CLICKHOUSE_PASSWORD:-}" ]] && ch_flags+=(-e "CLICKHOUSE_PASSWORD=$CLICKHOUSE_PASSWORD")
+  [[ -n "${CLICKHOUSE_DATABASE:-}" ]] && ch_flags+=(-e "CLICKHOUSE_DATABASE=$CLICKHOUSE_DATABASE")
+  [[ -n "${BENCH_SAVE_RAW_SAMPLES:-}" ]] && ch_flags+=(-e "BENCH_SAVE_RAW_SAMPLES=$BENCH_SAVE_RAW_SAMPLES")
   run docker run --rm \
     --network host \
+    "${ch_flags[@]}" \
     -v "$(realpath "$CORPUS_DIR"):/data/corpus:ro" \
     -v "$(realpath "$RESULTS_DIR"):/app/results" \
     --entrypoint "$cmd" \

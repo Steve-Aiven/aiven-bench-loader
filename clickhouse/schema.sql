@@ -99,7 +99,14 @@ SETTINGS index_granularity = 8192;
 --
 -- Control-plane directives written by the orchestrator, read and applied by
 -- the loader.  The loader marks applied rows by inserting a duplicate row
--- with applied_at set; ReplacingMergeTree(applied_at) collapses them.
+-- with applied_at != epoch; ReplacingMergeTree(applied_at) keeps the latest.
+--
+-- Unapplied directives have applied_at = epoch (toDateTime64(0, 3, 'UTC')).
+-- Applied directives have applied_at = the actual application timestamp.
+-- Use: WHERE applied_at = toDateTime64(0, 3, 'UTC') to find pending work.
+--
+-- Note: Nullable is NOT valid as a ReplacingMergeTree version column in
+-- ClickHouse >= 22; epoch sentinel is the standard alternative.
 --
 -- Supported directives (directive column):
 --   cancel   — stop the running job immediately
@@ -115,9 +122,9 @@ CREATE TABLE IF NOT EXISTS bench.bench_control
     job_id     String,
     ts         DateTime64(3, 'UTC'),
     seq        UInt32,
-    directive  LowCardinality(String),   -- cancel | throttle | pause | resume
-    payload    String DEFAULT '{}',       -- JSON payload for the directive
-    applied_at Nullable(DateTime64(3, 'UTC'))  -- NULL = not yet applied (semantic)
+    directive  LowCardinality(String),                                -- cancel | throttle | pause | resume
+    payload    String DEFAULT '{}',                                   -- JSON payload for the directive
+    applied_at DateTime64(3, 'UTC') DEFAULT toDateTime64(0, 3, 'UTC') -- epoch = not yet applied
 )
 ENGINE = ReplacingMergeTree(applied_at)
 PARTITION BY toStartOfMonth(ts)
@@ -152,6 +159,7 @@ SELECT *
 FROM bench.bench_runs FINAL;
 
 -- Rolling summary: last 7 days of completed runs with key metrics.
+-- Uses a subquery for FINAL so the table alias works in ClickHouse syntax.
 CREATE VIEW IF NOT EXISTS bench.v_recent_summary AS
 SELECT
     r.job_id,
@@ -161,11 +169,11 @@ SELECT
     r.finished_at,
     r.status,
     JSONExtractString(r.summary, 'report_path') AS report_path,
-    avg(CASE WHEN m.name = 'latency_p50_ms'  THEN m.value END) AS p50_ms,
-    avg(CASE WHEN m.name = 'latency_p99_ms'  THEN m.value END) AS p99_ms,
-    avg(CASE WHEN m.name = 'recall_at_10'    THEN m.value END) AS recall_at_10,
-    avg(CASE WHEN m.name = 'throughput_ops'  THEN m.value END) AS throughput_ops
-FROM bench.bench_runs FINAL AS r
+    avgIf(m.value, m.name = 'latency_p50_ms')  AS p50_ms,
+    avgIf(m.value, m.name = 'latency_p99_ms')  AS p99_ms,
+    avgIf(m.value, m.name = 'recall_at_10')    AS recall_at_10,
+    avgIf(m.value, m.name = 'throughput_ops')  AS throughput_ops
+FROM (SELECT * FROM bench.bench_runs FINAL) AS r
 LEFT JOIN bench.bench_metrics AS m ON r.job_id = m.job_id
 WHERE r.started_at >= now() - INTERVAL 7 DAY
 GROUP BY r.job_id, r.bench_type, r.label, r.started_at, r.finished_at, r.status, report_path

@@ -379,7 +379,7 @@ class ClickHouseSink:
                 f"SELECT job_id, ts, seq, directive, payload "
                 f"FROM {self._db}.bench_control FINAL "
                 f"WHERE job_id = %(job_id)s AND seq > %(seq)s "
-                f"AND applied_at IS NULL "
+                f"AND applied_at = toDateTime64(0, 3, 'UTC') "
                 f"ORDER BY seq ASC",
                 parameters={"job_id": self._job_id, "seq": self._last_seen_seq},
             ).result_rows
