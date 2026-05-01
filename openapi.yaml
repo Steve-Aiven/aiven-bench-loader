@@ -251,7 +251,13 @@ components:
         rounds:
           type: integer
           default: 3
-          description: Number of measurement rounds (`bench_type=search`, rounds mode only).
+          description: |
+            Number of measurement rounds.
+            - `bench_type=search`: rounds × query_count = total latency samples.
+            - `bench_type=recall`: same — rounds × query_count samples. Each round also
+              produces an independent recall@K score; variance across rounds measures
+              **recall stability** for approximate indexes (e.g. Faiss HNSW). Deterministic
+              indexes (Lucene) should show zero variance.
         k:
           type: integer
           default: 10

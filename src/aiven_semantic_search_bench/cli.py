@@ -268,6 +268,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--query-count", type=int, default=500)
     sp.add_argument("--k", type=int, default=10)
     sp.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        help=(
+            "Repeat the full query set N times (default: 1). "
+            "Raises total sample count for tail-latency confidence and measures "
+            "recall stability (variance across rounds) for approximate indexes."
+        ),
+    )
+    sp.add_argument(
         "--search-clients",
         type=int,
         default=1,
@@ -429,6 +439,7 @@ def main(argv: list[str] | None = None) -> int:
             out_dir=str(args.out_dir),
             opensearch_uri=args.opensearch_uri,
             search_clients=int(args.search_clients),
+            rounds=int(args.rounds),
         )
 
     if args.command == "bench-hybrid":

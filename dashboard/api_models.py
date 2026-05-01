@@ -145,7 +145,18 @@ class JobSpec(BaseModel):
             ),
         ),
     ] = None
-    rounds: int | None = 3
+    rounds: Annotated[
+        int | None,
+        Field(
+            default=3,
+            description=(
+                "Number of measurement rounds. For bench_type=search: rounds × query_count "
+                "= total latency samples. For bench_type=recall: each round produces an "
+                "independent recall@K score; variance across rounds measures recall stability "
+                "for approximate indexes. Default 3 for search, 1 for recall (CLI default)."
+            ),
+        ),
+    ] = 3
     k: Annotated[
         int | None,
         Field(description='Number of nearest neighbours to retrieve (search/recall).'),
