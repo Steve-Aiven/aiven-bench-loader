@@ -27,20 +27,30 @@ brew install colima docker
 
 ### 0.1 Start Colima
 
-The OpenSearch JVM heap is set to 1 GiB (`-Xms1g -Xmx1g` in
-`docker-compose.opensearch.yml`). Colima needs **at least 4 GiB total** to
-leave room for the OS, the bench containers, and the OpenSearch off-heap
-(direct memory, OS page cache). 2 CPUs is sufficient; 4 is comfortable.
+The required Colima allocation depends on your target corpus size:
 
+| Corpus | Colima RAM | OpenSearch JVM heap |
+|--------|-----------|---------------------|
+| corpus-smoke / corpus-20k | 4 GiB | 1g (default) |
+| **corpus-100k** | **8 GiB** | **2g** |
+
+For corpus-smoke / 20k (current default):
 ```bash
 colima start --cpu 2 --memory 4 --disk 60
 ```
 
-If Colima is already running, check its allocation and resize if needed:
+For corpus-100k (meaningful benchmarks):
+```bash
+colima start --cpu 4 --memory 8 --disk 100
+# Then update docker-compose.opensearch.yml:
+#   OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g
+```
+
+If Colima is already running, check its allocation:
 ```bash
 colima list
-# If MEMORY is less than 4GiB:
-colima stop && colima start --cpu 2 --memory 4 --disk 60
+# Resize if needed:
+colima stop && colima start --cpu 4 --memory 8 --disk 100
 ```
 
 ### 0.2 Start local OpenSearch
@@ -69,15 +79,48 @@ Expected build time: ~2 minutes (no PyTorch wheel).
 
 ## Phase 1 — Corpus
 
-Both corpora are pre-built and fully populated:
+### Corpus selection
+
+> **Important:** corpus size directly determines whether results are meaningful.
+> At 5k docs, HNSW returns near-perfect recall for every configuration — the
+> graph is so small that traversal is near-exhaustive. `ef_search`, quantization
+> type, and engine differences only become visible at ≥ 100k docs.
+
+| Directory | Docs | Queries | `ef_search` tradeoff visible? | byte vs float Δrecall? | Colima RAM | Suitable for |
+|-----------|------|---------|------------------------------|----------------------|-----------|--------------|
+| `corpus-2k-nomic/` | 2k | 200 | No | No | 4 GiB | Sanity checks |
+| `corpus-smoke/` | 5k | 500 | No | No | 4 GiB | Pipeline validation only |
+| `corpus-20k/` | 20k | 2k | Slightly | ~0.5% | 4 GiB | Development benchmarks |
+| **`corpus-100k/`** | **100k** | **10k** | **Yes** | **~3–5%** | **8 GiB** | **Production benchmarks** |
+
+Build the standard benchmark corpus (first-time, ~60 min on MPS):
+```bash
+# Standard benchmark corpus — requires 8 GiB Colima (see §0.1)
+bash scripts/build-corpus-100k.sh
+
+# Development corpus — fits in 4 GiB Colima, some differentiation
+bash scripts/build-corpus-20k.sh
+```
+
+Check that the required metadata fields are present:
+```bash
+bash scripts/validate-corpus.sh corpus-100k
+# Expect: has_metadata: true, categories and tenant_ids visible in docs.parquet
+```
+
+Available corpora:
 
 | Directory | Docs | Queries | Dims | Ground truth | Metadata |
 |-----------|------|---------|------|--------------|----------|
-| `corpus-smoke/` | 5 000 | 500 | 256, 512, 768 | `qrels.npy` present | **required** — rebuild if `has_metadata: false` |
-| `corpus-2k-nomic/` | 2 000 | 200 | 256, 512, 768 | `qrels.npy` present | optional (L07 not in 2k plan) |
+| `corpus-smoke/` | 5 000 | 500 | 256, 512, 768 | ✓ | ✓ |
+| `corpus-2k-nomic/` | 2 000 | 200 | 256, 512, 768 | ✓ | optional |
+| `corpus-20k/` | 20 000 | 2 000 | 256, 512, 768 | ✓ | ✓ |
+| `corpus-100k/` | 100 000 | 10 000 | 256, 512, 768 | ✓ | ✓ |
 
-The default benchmark script uses `corpus-smoke` (5 000 docs). That is sufficient to
-observe meaningful differences across engine, mode, and quantization choices.
+The default benchmark script uses `corpus-smoke`. Override for meaningful results:
+```bash
+CORPUS_DIR=./corpus-100k DOC_COUNT=100000 QUERY_COUNT=10000 bash bench-plan.sh
+```
 
 **L07 requires `has_metadata: true` in `corpus-smoke/manifest.json`.** Check with:
 ```bash
