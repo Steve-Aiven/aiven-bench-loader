@@ -30,7 +30,7 @@ import numpy as np
 from .clickhouse_sink import get_sink
 from .config import Settings
 from .corpus import load_corpus
-from .opensearch_client import KnnSpec, get_index_stats, get_opensearch_client
+from .opensearch_client import KnnSpec, encode_vector, get_index_stats, get_opensearch_client
 from .report_context import benchmark_report_extras
 from .reporter import raw_samples_enabled, write_report
 from .stats import percentiles_ms
@@ -40,7 +40,7 @@ _RECALL_KS = (1, 5, 10, 50, 100)
 
 
 def _knn_search_ids(
-    client, index: str, vector: np.ndarray, k: int
+    client, index: str, vector: np.ndarray, k: int, data_type: str = "float"
 ) -> list[str]:
     """Return the ordered list of document IDs from a k-NN search."""
     resp = client.search(
@@ -50,7 +50,7 @@ def _knn_search_ids(
             "query": {
                 "knn": {
                     "description_vector": {
-                        "vector": vector.tolist(),
+                        "vector": encode_vector(vector, data_type),
                         "k": k,
                     }
                 }
@@ -144,7 +144,7 @@ def cmd_bench_recall(
         true_ids = {idx_to_id[int(i)] for i in true_row_indices if int(i) in idx_to_id}
 
         t0 = time.perf_counter()
-        retrieved = _knn_search_ids(client, settings.opensearch_index, vec, k=k)
+        retrieved = _knn_search_ids(client, settings.opensearch_index, vec, k=k, data_type=knn.data_type)
         lat_ms = (time.perf_counter() - t0) * 1000
         latencies_ms.append(lat_ms)
 

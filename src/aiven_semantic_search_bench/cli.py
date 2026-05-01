@@ -3,34 +3,39 @@ CLI for the OpenSearch k-NN benchmarking tool.
 
 Subcommands
 -----------
-  bench-build-corpus        One-time: sample real text + embed once at 3072 dims.
-  bench-build-groundtruth   One-time: brute-force top-100 nearest neighbours.
+  bench-build-corpus        One-time (local Mac): sample real text + embed once.
+  bench-build-groundtruth   One-time (local Mac): brute-force top-100 neighbours.
   bench-index               Indexing throughput at varying batch sizes.
   bench-search              k-NN query latency over multiple rounds.
   bench-recall              recall@K accuracy against brute-force ground truth.
   bench-hybrid              BM25 + k-NN hybrid queries with optional filter.
+  bench-stress              Sustained mixed index+search load (chaos/saturation).
   bench-recover             Cold-start cost after auto-pause (free/hobbyist tier).
   bench-plan-change         Upgrade / downgrade impact while service is live.
 
 Every measurement command accepts --engine, --method, --mode, --compression,
 --data-type, --m, --ef-construction, --ef-search, and --with-metadata so the
 same workload can be swept across the k-NN configuration matrix from the
-command line (the UI generates equivalent jobs automatically).
+command line (the loader API generates equivalent jobs automatically).
+
+bench-build-corpus and bench-build-groundtruth require the [build] extra
+(sentence-transformers, datasets). They are intended for local Mac use with
+Apple MPS; the Docker/loader image does NOT install the [build] extra.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from dataclasses import replace
 
 from .bench_index import cmd_bench_index
+from .bench_hybrid import cmd_bench_hybrid
 from .bench_plan_change import cmd_bench_plan_change
 from .bench_recall import cmd_bench_recall
 from .bench_recover import cmd_bench_recover
 from .bench_search import cmd_bench_search
-from .bench_hybrid import cmd_bench_hybrid
+from .bench_stress import cmd_bench_stress
 from .config import Settings
 from .corpus import SOURCE_NAMES, SUPPORTED_DIMS, build_corpus, build_groundtruth
 from .opensearch_client import KnnSpec
@@ -177,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ── bench-build-corpus ───────────────────────────────────────────────────
     sp = sub.add_parser(
         "bench-build-corpus",
-        help="One-time: sample real text from HF datasets + embed once at 3072 dims",
+        help="One-time (local Mac): sample real text from HF datasets + embed once. Requires pip install -e '.[build]'",
     )
     sp.add_argument("--dataset", choices=_PRESET_CHOICES, default="mixed")
     sp.add_argument("--doc-count", type=int, default=100_000)
@@ -205,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ── bench-build-groundtruth ──────────────────────────────────────────────
     sp = sub.add_parser(
         "bench-build-groundtruth",
-        help="One-time: compute brute-force top-K nearest neighbours (writes corpus/qrels.npy)",
+        help="One-time (local Mac): compute brute-force top-K nearest neighbours (writes corpus/qrels.npy)",
     )
     sp.add_argument(
         "--corpus-dir",
@@ -280,6 +285,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         help="Metadata filter selectivity: none / low (~25%% match) / high (~6%% match)",
     )
+    sp.add_argument("--label", default="unlabeled")
+    sp.add_argument("--out-dir", default="results")
+    _add_corpus_args(sp)
+    _add_knn_spec_args(sp)
+
+    # ── bench-stress ─────────────────────────────────────────────────────────
+    sp = sub.add_parser(
+        "bench-stress",
+        help="Sustained mixed index+search load — chaos/saturation test",
+    )
+    sp.add_argument("--duration", type=int, default=120, help="Minimum run duration in seconds (default: 120)")
+    sp.add_argument("--index-clients", type=int, default=8, help="Concurrent index threads (default: 8)")
+    sp.add_argument("--search-clients", type=int, default=16, help="Concurrent search threads (default: 16)")
+    sp.add_argument("--batch-size", type=int, default=100, help="Bulk index batch size (default: 100)")
+    sp.add_argument("--k", type=int, default=100, help="k for k-NN search during stress (default: 100)")
+    sp.add_argument("--post-settle-s", type=int, default=60, help="Seconds to continue after plan-change settles (default: 60)")
+    sp.add_argument("--plan-change-target", default="", help="Aiven plan to change to mid-run (optional)")
+    sp.add_argument("--plan-change-after-s", type=int, default=60, help="Seconds before triggering plan change (default: 60)")
+    sp.add_argument("--thanos-uri", default="", help="Thanos/Prometheus base URI for metric collection (optional)")
     sp.add_argument("--label", default="unlabeled")
     sp.add_argument("--out-dir", default="results")
     _add_corpus_args(sp)
@@ -403,7 +427,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "bench-hybrid":
         embed_dim = _resolve_embed_dim(args.embed_dim, settings)
         spec = _knn_spec_from_args(args, embed_dim)
-        # Hybrid always needs text and metadata fields.
         spec = KnnSpec(
             embed_dim=spec.embed_dim,
             engine=spec.engine,
@@ -430,6 +453,28 @@ def main(argv: list[str] | None = None) -> int:
             label=str(args.label),
             out_dir=str(args.out_dir),
             opensearch_uri=args.opensearch_uri,
+        )
+
+    if args.command == "bench-stress":
+        embed_dim = _resolve_embed_dim(args.embed_dim, settings)
+        spec = _knn_spec_from_args(args, embed_dim)
+        return cmd_bench_stress(
+            settings,
+            embed_dim=embed_dim,
+            spec=spec,
+            corpus_dir=str(args.corpus_dir),
+            out_dir=str(args.out_dir),
+            label=str(args.label),
+            opensearch_uri=args.opensearch_uri,
+            index_clients=int(args.index_clients),
+            search_clients=int(args.search_clients),
+            duration=int(args.duration),
+            batch_size=int(args.batch_size),
+            k=int(args.k),
+            post_settle_s=int(args.post_settle_s),
+            plan_change_target=str(args.plan_change_target),
+            plan_change_after_s=int(args.plan_change_after_s),
+            thanos_uri=str(args.thanos_uri),
         )
 
     if args.command == "bench-recover":
@@ -464,11 +509,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _main_console_script(command: str) -> int:
-    """Entry point for setuptools `[project.scripts]` wrappers.
-
-    Installed scripts invoke us with ``sys.argv == [script_path, <user args>]``;
-    :func:`argparse` expects the subcommand name as ``argv[1]``.
-    """
+    """Entry point for setuptools `[project.scripts]` wrappers."""
     sys.argv.insert(1, command)
     return main()
 
@@ -495,6 +536,10 @@ def main_bench_recall() -> int:
 
 def main_bench_hybrid() -> int:
     return _main_console_script("bench-hybrid")
+
+
+def main_bench_stress() -> int:
+    return _main_console_script("bench-stress")
 
 
 def main_bench_recover() -> int:

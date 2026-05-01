@@ -5,13 +5,25 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aiven-semantic-search-bench"
 version = "0.1.0"
-description = "OpenSearch k-NN benchmark loader and standalone runner — Faiss vs Lucene across 2.17, 2.19, and 3.3."
+description = "OpenSearch k-NN benchmark runner and loader API — Faiss vs Lucene across 2.17, 2.19, and 3.x."
 requires-python = ">=3.10"
 readme = "README.md"
 dependencies = [
+    # OpenSearch client
     "opensearch-py>=3.1,<4",
+    # Numeric + parquet (corpus load, recall computation)
     "numpy>=2.0,<3",
+    "pandas>=2.2,<3",
+    "pyarrow>=15",
+    # HTTP client (Aiven REST API, report preflight, Thanos queries)
     "httpx>=0.27,<1",
+    # Loader API (FastAPI shim for aiven-bench-orchestrator)
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "sse-starlette>=2.1,<3",
+    "prometheus-client>=0.21,<1",
+    # ClickHouse sink (orchestrator telemetry / control directives)
+    "clickhouse-connect>=0.7,<1",
 ]
 
 [project.urls]
@@ -26,44 +38,27 @@ bench-index = "aiven_semantic_search_bench.cli:main_bench_index"
 bench-search = "aiven_semantic_search_bench.cli:main_bench_search"
 bench-recall = "aiven_semantic_search_bench.cli:main_bench_recall"
 bench-hybrid = "aiven_semantic_search_bench.cli:main_bench_hybrid"
+bench-stress = "aiven_semantic_search_bench.cli:main_bench_stress"
 bench-recover = "aiven_semantic_search_bench.cli:main_bench_recover"
 bench-plan-change = "aiven_semantic_search_bench.cli:main_bench_plan_change"
 
 [project.optional-dependencies]
 # pip install -e '.[build]' — everything needed to build the embedding corpus locally.
 # On Mac Apple Silicon this picks up MPS automatically via the default torch wheel.
+# NOT installed in the Docker image (Dockerfile runs plain `pip install .`).
 build = [
     "sentence-transformers>=3.0,<4",
     "datasets>=3.0,<5",
     "pyarrow>=15",
-    # Required by nomic-ai/nomic-embed-text-v1.5 (transformers dynamic module import).
     "einops>=0.7",
 ]
-# pip install -e '.[build-gemini]' — google-generativeai only (use with CORPUS_EMBED_BACKEND=gemini).
+# pip install -e '.[build-gemini]' — Google AI Studio API (CORPUS_EMBED_BACKEND=gemini).
 build-gemini = [
     "google-generativeai>=0.8,<1",
 ]
 # pip install -e '.[build-vertex]' — Vertex AI SDK (ADC); CORPUS_EMBED_BACKEND=vertex.
 build-vertex = [
     "google-cloud-aiplatform>=1.75,<2",
-]
-# pip install -e '.[ui]' — the NiceGUI standalone dashboard + charting libs.
-ui = [
-    "nicegui>=1.4",
-    "plotly>=5.22,<6",
-    "pandas>=2.2,<3",
-]
-# pip install -e '.[loader]' — the FastAPI loader API exposed when this image
-# is deployed as an Aiven Application by the aiven-bench-orchestrator.
-loader = [
-    "fastapi>=0.115,<1",
-    "uvicorn[standard]>=0.30,<1",
-    "sse-starlette>=2.1,<3",
-    "prometheus-client>=0.21,<1",
-]
-# pip install -e '.[dev]' — everything needed for local development (corpus + UI + loader).
-dev = [
-    "aiven-semantic-search-bench[build,build-gemini,build-vertex,ui,loader]",
 ]
 
 [tool.setuptools]

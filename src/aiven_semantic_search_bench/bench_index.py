@@ -36,12 +36,13 @@ import numpy as np
 from .clickhouse_sink import get_sink
 from .config import Settings
 from .corpus import load_corpus
-from .opensearch_client import KnnSpec, get_opensearch_client, reset_index
+from .opensearch_client import KnnSpec, encode_vector, get_opensearch_client, reset_index
 from .report_context import benchmark_report_extras
 from .reporter import raw_samples_enabled, write_report
 from .stats import chunked, percentiles_ms, stopwatch
 
 _DEFAULT_SPEC = KnnSpec(embed_dim=768)
+
 
 
 def _bulk_index_request(
@@ -58,7 +59,7 @@ def _bulk_index_request(
         doc: dict = {
             "description":        description,
             "source":             source,
-            "description_vector": vector.tolist(),
+            "description_vector": encode_vector(vector, spec.data_type),
         }
         if spec.with_text:
             doc["content"] = description

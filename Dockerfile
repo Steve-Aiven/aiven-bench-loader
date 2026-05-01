@@ -1,37 +1,46 @@
 # syntax=docker/dockerfile:1.7
+#
+# Lean benchmark runner image.
+#
+# This image contains only the FastAPI loader API and the measurement commands
+# (bench-index, bench-search, bench-recall, bench-hybrid, bench-stress,
+# bench-recover, bench-plan-change).  The NiceGUI dashboard and the embedding /
+# corpus-build stack have been removed; the heavy PyTorch wheel is no longer
+# installed, which cuts image size from ~1.5 GB to ~450 MB and build time from
+# ~8 min to ~2 min.
+#
+# Corpus is always supplied as a pre-built directory mounted at /data/corpus.
+# Build it once on the host (Mac with MPS) using the main branch:
+#
+#   HF_EMBED_DEVICE=mps python3 -m aiven_semantic_search_bench bench-build-corpus \
+#       --dataset mixed --doc-count 20000 --query-count 2000 \
+#       --corpus-dir ./corpus-20k-nomic
+#   python3 -m aiven_semantic_search_bench bench-build-groundtruth \
+#       --corpus-dir ./corpus-20k-nomic
+#
+# Run modes:
+#   * Default (loader API): uvicorn dashboard.api:app on :8080
+#       docker run -p 8080:8080 -e LOADER_API_KEY=... aiven-semantic-search-bench:lean
+#   * CLI benchmark (override entrypoint):
+#       docker run --entrypoint bench-index aiven-semantic-search-bench:lean \
+#           --doc-count 5000 --embed-dim 768 --label "local/smoke/L01" \
+#           --opensearch-uri http://host.docker.internal:9200
 
-# ---------- Builder stage ----------
-# Installs Python dependencies into an isolated virtualenv that gets copied
-# into the runtime stage.  Keeping pip and build artifacts out of the final
-# image keeps it small and reduces the attack surface.
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
+# Install dependencies from pyproject.toml (no torch, no sentence-transformers,
+# no datasets, no nicegui — just the loader API + bench runner stack).
 WORKDIR /build
-
-COPY requirements.txt pyproject.toml ./
+COPY pyproject.toml ./
 COPY src/ ./src/
+RUN pip install .
 
-RUN python3 -m venv /opt/venv \
-    # Install CPU-only PyTorch first to avoid pulling ~3 GB of CUDA/cuDNN libs.
-    # sentence-transformers will find torch already installed and skip the CUDA wheel.
- && /opt/venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu \
- && /opt/venv/bin/pip install -r requirements.txt \
- && /opt/venv/bin/pip install .
-
-# ---------- Runtime stage ----------
-FROM python:3.12-slim AS runtime
-
-ENV PATH="/opt/venv/bin:${PATH}" \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# Run as a non-root user.  The uid/gid are fixed so that volume permissions
-# are predictable on hosts that mount results/ or corpus/ from outside the
-# container.
+# Non-root bench user with predictable uid/gid for volume permission parity.
 RUN groupadd --system --gid 1000 bench \
  && useradd  --system --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin bench
 
@@ -39,28 +48,20 @@ WORKDIR /app
 RUN mkdir -p /app/results /data/corpus /data/results \
  && chown -R bench:bench /app /data
 
-COPY --from=builder /opt/venv /opt/venv
-COPY --chown=bench:bench dashboard/ /app/dashboard/
+# Loader API source (api.py + generated api_models.py).
+# app.py and experiments.py have been removed from this branch.
+COPY --chown=bench:bench dashboard/api.py dashboard/api_models.py /app/dashboard/
+
+# Package source — imported via PYTHONPATH (no editable install in runtime).
 COPY --chown=bench:bench src/ /app/src/
 
 USER bench
 
-# Make the src package importable without pip install in runtime stage.
 ENV PYTHONPATH="/app/src:${PYTHONPATH}"
 
 EXPOSE 8080
 
-# Two run modes share the image:
-#   * Default: standalone NiceGUI dashboard (./dashboard/app.py on :8080).
-#   * LOADER_MODE=1 (with LOADER_API_KEY): FastAPI loader shim served by
-#     uvicorn — what aiven/aiven-bench-orchestrator deploys as an
-#     Aiven Application.
-# The CLI commands (bench-build-corpus, bench-index, bench-search, ...) stay
-# available either way; just override CMD when invoking the container.
-ENTRYPOINT ["python3", "-c", "\
-import os, subprocess, sys; \
-cmd = ['uvicorn', 'dashboard.api:app', '--host', '0.0.0.0', '--port', '8080'] \
-    if os.environ.get('LOADER_MODE') == '1' \
-    else ['python3', '/app/dashboard/app.py']; \
-sys.exit(subprocess.call(cmd))"]
+# The loader API is the only HTTP mode; LOADER_MODE switch is gone.
+# Override ENTRYPOINT to run a CLI bench command directly.
+ENTRYPOINT ["uvicorn", "dashboard.api:app", "--host", "0.0.0.0", "--port", "8080"]
 CMD []

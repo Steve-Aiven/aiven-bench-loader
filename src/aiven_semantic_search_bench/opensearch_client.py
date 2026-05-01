@@ -289,6 +289,36 @@ def build_index_mapping(spec: KnnSpec) -> dict[str, Any]:
     }
 
 
+# ── Vector encoding ───────────────────────────────────────────────────────────
+
+
+def encode_vector(vector: "np.ndarray", data_type: str) -> list:
+    """
+    Encode a float32 L2-normalized vector for the OpenSearch ``data_type``.
+
+    float / fp16
+        No-op — OpenSearch accepts float32 JSON and downcasts fp16 server-side.
+    byte
+        Scale ``[-1, 1]`` → ``[-127, 127]``, round to int8.
+        Cosine ordering is preserved because vectors are L2-normalised and
+        ``innerproduct`` is used as the Faiss space type.
+    binary
+        Not implemented — requires ``space_type=hamming`` and bit-packed
+        vectors (``np.packbits``).  Raises ``NotImplementedError`` explicitly
+        rather than silently sending incompatible data.
+    """
+    import numpy as np
+
+    if data_type == "byte":
+        return np.round(vector * 127.0).clip(-128, 127).astype(np.int8).tolist()
+    if data_type == "binary":
+        raise NotImplementedError(
+            "binary data_type requires space_type=hamming and bit-packed vectors; "
+            "see bench-plan.md L09 for the required code changes."
+        )
+    return vector.tolist()
+
+
 # ── Index lifecycle ───────────────────────────────────────────────────────────
 
 

@@ -61,6 +61,13 @@ class KnnSpec(BaseModel):
     data_type: DataType | None = 'float'
     hnsw_m: int | None = 16
     hnsw_ef_construction: int | None = 100
+    hnsw_ef_search: Annotated[
+        int | None,
+        Field(
+            default=256,
+            description='ef_search controls the size of the dynamic list used during k-NN graph traversal. Higher values improve recall at the cost of latency.',
+        ),
+    ] = 256
     with_text: bool | None = False
     with_metadata: bool | None = False
     derived_source: bool | None = False
@@ -82,6 +89,8 @@ class BenchType(StrEnum):
     recall = 'recall'
     hybrid = 'hybrid'
     stress = 'stress'
+    recover = 'recover'
+    plan_change = 'plan_change'
 
 
 class FilterSelectivity(StrEnum):
@@ -176,6 +185,36 @@ class JobSpec(BaseModel):
     ] = ''
     aiven_project: str | None = ''
     aiven_service_name: str | None = ''
+    # bench_type=recover settings
+    recover_idle_minutes: Annotated[
+        int | None,
+        Field(
+            default=10,
+            description='For bench_type=recover: minutes to let the service idle before measuring warm-up latency.',
+        ),
+    ] = 10
+    # bench_type=plan_change settings
+    plan_change_from_plan: Annotated[
+        str | None,
+        Field(
+            default='',
+            description='For bench_type=plan_change: current Aiven plan name (omit to auto-detect from API).',
+        ),
+    ] = ''
+    plan_change_and_back: Annotated[
+        bool | None,
+        Field(
+            default=False,
+            description='For bench_type=plan_change: if true, change plan then change back after post_settle_s.',
+        ),
+    ] = False
+    plan_change_pre_load_seconds: Annotated[
+        int | None,
+        Field(
+            default=60,
+            description='For bench_type=plan_change: seconds of load to run before initiating the plan change.',
+        ),
+    ] = 60
 
 
 class RunResponse(RootModel[str]):
@@ -267,3 +306,37 @@ class HealthResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: str
+
+
+class MatrixCell(BaseModel):
+    cell_label: Annotated[
+        str,
+        Field(description='Short identifier for this matrix cell, e.g. "L01" or "faiss-hnsw-float".'),
+    ]
+    jobs: Annotated[
+        list[JobSpec],
+        Field(
+            description='Ordered list of job specs to run sequentially for this cell. '
+                        'Typically: index → search → recall → hybrid.',
+            min_length=1,
+        ),
+    ]
+
+
+class MatrixRequest(BaseModel):
+    matrix_id: Annotated[
+        str,
+        Field(description='Unique run identifier assigned by the orchestrator.'),
+    ]
+    cells: Annotated[
+        list[MatrixCell],
+        Field(description='Ordered list of matrix cells to execute. Cells run sequentially.', min_length=1),
+    ]
+    stop_on_failure: Annotated[
+        bool,
+        Field(
+            default=False,
+            description='When true, abort the matrix run on the first cell failure. '
+                        'When false (default), log the failure and continue to the next cell.',
+        ),
+    ] = False

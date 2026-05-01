@@ -51,6 +51,7 @@ from .config import Settings
 from .corpus import load_corpus
 from .opensearch_client import (
     KnnSpec,
+    encode_vector,
     force_merge as os_force_merge,
     get_index_stats,
     get_opensearch_client,
@@ -66,7 +67,14 @@ _WARMUP_MAX_ROUNDS = 5
 
 # ── Core search call ──────────────────────────────────────────────────────────
 
-def _knn_search(client, index: str, vector: np.ndarray, k: int, ef_search: int) -> None:
+def _knn_search(
+    client,
+    index: str,
+    vector: np.ndarray,
+    k: int,
+    ef_search: int,
+    data_type: str = "float",
+) -> None:
     """Issue one k-NN search.  Return value is discarded; we only time the call."""
     client.search(
         index=index,
@@ -75,7 +83,7 @@ def _knn_search(client, index: str, vector: np.ndarray, k: int, ef_search: int) 
             "query": {
                 "knn": {
                     "description_vector": {
-                        "vector": vector.tolist(),
+                        "vector": encode_vector(vector, data_type),
                         "k": k,
                         "filter": {"match_all": {}},
                     }
@@ -95,6 +103,7 @@ def _warmup_until_stable(
     k: int,
     ef_search: int,
     queries_per_round: int,
+    data_type: str = "float",
 ) -> None:
     """
     Issue warmup queries until p95 latency changes less than
@@ -114,7 +123,7 @@ def _warmup_until_stable(
         lats: list[float] = []
         for v in vecs:
             t0 = time.perf_counter()
-            _knn_search(client, index, v, k=k, ef_search=ef_search)
+            _knn_search(client, index, v, k=k, ef_search=ef_search, data_type=data_type)
             lats.append((time.perf_counter() - t0) * 1000)
 
         p95 = percentiles_ms(lats)["p95_ms"]
@@ -144,6 +153,7 @@ def _run_rounds(
     *,
     rounds: int,
     search_clients: int,
+    data_type: str = "float",
 ) -> list[dict]:
     """
     Rounds mode: for each round dispatch all ``len(query_vectors)`` queries
@@ -171,7 +181,7 @@ def _run_rounds(
         def _worker(vecs: np.ndarray) -> None:
             for v in vecs:
                 t0 = time.perf_counter()
-                _knn_search(client, index, v, k=k, ef_search=ef_search)
+                _knn_search(client, index, v, k=k, ef_search=ef_search, data_type=data_type)
                 with lock:
                     round_lats.append((time.perf_counter() - t0) * 1000)
 
@@ -227,6 +237,7 @@ def _run_sustained(
     search_clients: int,
     target_throughput: float,
     time_period: int,
+    data_type: str = "float",
 ) -> list[dict]:
     """
     Sustained-throughput mode, modelled on OSB's ``target_throughput`` +
@@ -270,7 +281,7 @@ def _run_sustained(
                 break
             t0 = time.perf_counter()
             try:
-                _knn_search(client, index, vec, k=k, ef_search=ef_search)
+                _knn_search(client, index, vec, k=k, ef_search=ef_search, data_type=data_type)
                 lat_ms = (time.perf_counter() - t0) * 1000
                 with lock:
                     latencies.append(lat_ms)
@@ -415,6 +426,7 @@ def cmd_bench_search(
             k=k,
             ef_search=knn.ef_search,
             queries_per_round=min(warmup_queries, len(query_vectors)),
+            data_type=knn.data_type,
         )
 
     # ── Step 3: measure ───────────────────────────────────────────────────
@@ -428,6 +440,7 @@ def cmd_bench_search(
             search_clients=search_clients,
             target_throughput=target_throughput,
             time_period=time_period,
+            data_type=knn.data_type,
         )
     else:
         results = _run_rounds(
@@ -438,6 +451,7 @@ def cmd_bench_search(
             ef_search=knn.ef_search,
             rounds=rounds,
             search_clients=search_clients,
+            data_type=knn.data_type,
         )
 
     # ── Report ────────────────────────────────────────────────────────────

@@ -69,6 +69,7 @@ from dashboard.api_models import (
     CorpusStatus,
     HealthResponse,
     JobSpec,
+    MatrixRequest,
 )
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -455,7 +456,6 @@ def _dispatch_job(
     sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
     from aiven_semantic_search_bench.config import Settings
     from aiven_semantic_search_bench.opensearch_client import KnnSpec
-    from aiven_semantic_search_bench.job_spec import BenchmarkJob
     from aiven_semantic_search_bench.clickhouse_sink import get_sink
 
     sink = get_sink()
@@ -482,6 +482,7 @@ def _dispatch_job(
         data_type=str(raw_spec.data_type) if raw_spec.data_type else "float",
         m=(raw_spec.hnsw_m or 16),
         ef_construction=(raw_spec.hnsw_ef_construction or 100),
+        ef_search=(raw_spec.hnsw_ef_search or 256),
         with_text=(raw_spec.with_text or False),
         with_metadata=(raw_spec.with_metadata or False),
         derived_source=(raw_spec.derived_source or False),
@@ -638,6 +639,36 @@ def _dispatch_job(
                 aiven_project=(spec.aiven_project or ""),
                 aiven_service_name=(spec.aiven_service_name or ""),
                 thanos_uri="",
+            )
+            ok = (rc == 0)
+
+        elif bench_type == "recover":
+            from aiven_semantic_search_bench.bench_recover import cmd_bench_recover
+            rc = cmd_bench_recover(
+                settings,
+                idle_minutes=(spec.recover_idle_minutes or 10),
+                doc_count=spec.doc_count,
+                embed_dim=spec.embed_dim,
+                corpus_dir=str(_CORPUS_DIR),
+                label=f"{spec.service_label}/{bench_type}",
+                out_dir=str(_RESULTS_DIR),
+            )
+            ok = (rc == 0)
+
+        elif bench_type == "plan_change":
+            from aiven_semantic_search_bench.bench_plan_change import cmd_bench_plan_change
+            rc = cmd_bench_plan_change(
+                settings,
+                from_plan=(spec.plan_change_from_plan or ""),
+                to_plan=(spec.plan_change_target or ""),
+                and_back=(spec.plan_change_and_back or False),
+                pre_load_seconds=(spec.plan_change_pre_load_seconds or 60),
+                post_settle_seconds=(spec.post_settle_s or 60),
+                doc_count=spec.doc_count,
+                embed_dim=spec.embed_dim,
+                corpus_dir=str(_CORPUS_DIR),
+                label=f"{spec.service_label}/{bench_type}",
+                out_dir=str(_RESULTS_DIR),
             )
             ok = (rc == 0)
 
@@ -1023,6 +1054,141 @@ async def corpus_fetch(req: CorpusFetchRequest) -> CorpusStatus:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Failed to process fetched archive: {exc}",
             ) from exc
+
+
+@app.post("/matrix", dependencies=[Depends(_require_auth)])
+async def run_matrix(req: MatrixRequest) -> EventSourceResponse:
+    """
+    Submit a full benchmark matrix for sequential execution.
+
+    The orchestrator POSTs a ``MatrixRequest`` containing one or more named
+    cells (e.g. ``L01``…``L08``), each with an ordered list of ``JobSpec``
+    objects.  The loader executes every job in every cell sequentially, in
+    the order supplied, and streams progress as SSE.
+
+    SSE event types
+    ---------------
+    ``cell_start``   — ``{"matrix_id": "…", "cell": "L01", "job_index": 0, "total_jobs": 4}``
+    ``log``          — free-form log line from the running job
+    ``cell_result``  — ``{"matrix_id": "…", "cell": "L01", "ok": true, "report_path": "…"}``
+    ``matrix_result``— ``{"matrix_id": "…", "cells_ok": 7, "cells_failed": 1, "results": […]}``
+    """
+    import asyncio
+    import queue as q_module
+
+    sync_q: q_module.Queue = q_module.Queue()
+
+    def _run_matrix() -> None:
+        cell_results = []
+        with _job_lock:
+            for cell in req.cells:
+                cell_ok = True
+                for i, job_spec in enumerate(cell.jobs):
+                    # Fill corpus defaults before dispatching
+                    try:
+                        resolved = _resolve_job_spec_with_corpus(job_spec)
+                    except HTTPException as exc:
+                        sync_q.put({
+                            "event": "log",
+                            "data": f"[matrix] {cell.cell_label} job {i}: corpus not ready — {exc.detail}",
+                        })
+                        cell_ok = False
+                        break
+
+                    sync_q.put({
+                        "event": "cell_start",
+                        "data": json.dumps({
+                            "matrix_id": req.matrix_id,
+                            "cell": cell.cell_label,
+                            "job_index": i,
+                            "total_jobs": len(cell.jobs),
+                            "bench_type": resolved.bench_type if hasattr(resolved.bench_type, "__str__") else str(resolved.bench_type),
+                        }),
+                    })
+
+                    cancel_ev = _register_cancel(resolved.job_id)
+                    try:
+                        _dispatch_job(resolved, cancel_ev, sync_q)  # type: ignore[arg-type]
+                    finally:
+                        _unregister_cancel(resolved.job_id)
+
+                    # Peek at the last result event to determine ok/fail
+                    # _dispatch_job puts {"event": "result", "data": "{...}"} into sync_q
+                    # We collect synchronously here so we check *after* result lands.
+                    # The result is already in the queue — drain pending items briefly
+                    # to find it; real events are still forwarded to the SSE consumer.
+                    result_ok = True
+                    tmp: list[dict] = []
+                    while not sync_q.empty():
+                        item = sync_q.get_nowait()
+                        tmp.append(item)
+                        if item.get("event") == "result":
+                            try:
+                                result_ok = json.loads(item["data"]).get("ok", False)
+                            except Exception:
+                                result_ok = False
+                    for item in tmp:
+                        sync_q.put(item)
+
+                    if not result_ok:
+                        cell_ok = False
+                        sync_q.put({
+                            "event": "log",
+                            "data": f"[matrix] {cell.cell_label} job {i} ({resolved.bench_type}) failed — "
+                                    + ("aborting cell" if not req.stop_on_failure else "aborting matrix"),
+                        })
+                        break
+
+                sync_q.put({
+                    "event": "cell_result",
+                    "data": json.dumps({
+                        "matrix_id": req.matrix_id,
+                        "cell": cell.cell_label,
+                        "ok": cell_ok,
+                    }),
+                })
+                cell_results.append({"cell": cell.cell_label, "ok": cell_ok})
+
+                if not cell_ok and req.stop_on_failure:
+                    break
+
+        sync_q.put({
+            "event": "matrix_result",
+            "data": json.dumps({
+                "matrix_id": req.matrix_id,
+                "cells_ok": sum(1 for r in cell_results if r["ok"]),
+                "cells_failed": sum(1 for r in cell_results if not r["ok"]),
+                "results": cell_results,
+            }),
+        })
+        sync_q.put(None)  # sentinel
+
+    thread = threading.Thread(target=_run_matrix, daemon=True)
+    thread.start()
+
+    async def _generate() -> AsyncGenerator[dict, None]:
+        import queue as _q
+        try:
+            while True:
+                try:
+                    item = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: sync_q.get(timeout=30)
+                    )
+                except _q.Empty:
+                    if not thread.is_alive():
+                        break
+                    continue
+                except Exception:
+                    break
+                if item is None:
+                    break
+                yield item
+                if item.get("event") == "matrix_result":
+                    break
+        finally:
+            pass
+
+    return EventSourceResponse(_generate())
 
 
 @app.get("/healthz")

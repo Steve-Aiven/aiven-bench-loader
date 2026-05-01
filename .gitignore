@@ -11,9 +11,11 @@ dist/
 build/
 
 # Corpus data (large binary files — build locally with bench-build-corpus)
-# Use /corpus/ to anchor to the repo root, not the Python package.
+# Use explicit anchors to avoid matching the Python package subdirectory.
 /corpus/
 /corpus_*/
+/corpus-*/
+*.tar.gz
 *.npy
 *.parquet
 

@@ -1,0 +1,974 @@
+openapi: 3.1.0
+
+info:
+  title: Aiven Bench Loader API
+  version: "1.1.0"
+  description: |
+    Benchmark execution engine deployed as an Aiven Application.
+
+    The loader exposes a REST API that the **aiven-bench-orchestrator** uses to:
+    - Upload or build a vector corpus.
+    - Submit individual benchmark jobs (index / search / recall / hybrid / stress /
+      recover / plan_change) and receive live logs via Server-Sent Events.
+    - Submit a full benchmark **matrix** (e.g. the L01–L08 plan) for sequential
+      end-to-end execution with cell-level progress streaming.
+    - Download result files written by each benchmark run.
+
+    ## Authentication
+    All endpoints except `/healthz` and `/metrics` require:
+    ```
+    Authorization: Bearer <LOADER_API_KEY>
+    ```
+    `LOADER_API_KEY` is injected by the orchestrator as an environment variable
+    when the loader is deployed as an Aiven Application.
+
+    ## ClickHouse Telemetry
+    When the orchestrator provisions a ClickHouse service and sets the four env
+    vars below, every benchmark run is automatically written into it:
+
+    | Env var | Example |
+    |---|---|
+    | `CLICKHOUSE_URL` | `https://clickhouse-bench.aivencloud.com:14833` |
+    | `CLICKHOUSE_USER` | `avnadmin` |
+    | `CLICKHOUSE_PASSWORD` | `…` |
+    | `CLICKHOUSE_DATABASE` | `bench` (default) |
+
+    The **schema is owned by the orchestrator** (see `clickhouse/schema.sql`).
+    The loader only inserts rows and reads `bench_control` for live directives.
+
+    ### Tables written by the loader
+
+    | Table | Description |
+    |---|---|
+    | `bench_runs` | One row per job — job_id, bench_type, status, spec JSON, summary JSON |
+    | `bench_logs` | Structured stdout/stderr lines — job_id, timestamp, level, phase, msg |
+    | `bench_metrics` | Time-series samples — job_id, timestamp, metric name, value, label map |
+    | `bench_control` | Read by the loader — orchestrator writes cancel/throttle/pause/resume directives |
+
+    ## Server-Sent Events format
+    Endpoints that stream progress return `text/event-stream` (SSE):
+    ```
+    event: log
+    data: [loader] Starting search job abc123
+
+    event: result
+    data: {"ok": true, "report_path": "/data/results/bench-search-….json"}
+    ```
+
+servers:
+  - url: http://localhost:8080
+    description: Local Colima / Docker development
+  - url: https://loader.example.aivencloud.com
+    description: Aiven Application deployment
+
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: LOADER_API_KEY set by the orchestrator at deploy time.
+
+  schemas:
+
+    Engine:
+      type: string
+      enum: [faiss, lucene]
+      description: k-NN index engine.
+
+    Method:
+      type: string
+      enum: [hnsw, ivf]
+      description: |
+        Index algorithm.
+        - `hnsw` — Hierarchical Navigable Small World graph (default; works with all engines).
+        - `ivf` — Inverted File index (Faiss only; requires a training step before indexing).
+
+    SpaceType:
+      type: string
+      enum: [cosinesimil, innerproduct, l2]
+      description: |
+        Distance / similarity metric.
+        - `cosinesimil` — cosine similarity (Lucene only for non-byte vectors).
+        - `innerproduct` — inner product (Faiss; also used for byte vectors since L2-normalised
+          byte vectors preserve cosine order).
+        - `l2` — Euclidean distance.
+
+    Mode:
+      type: string
+      enum: [in_memory, on_disk]
+      description: Faiss index storage mode. `in_memory` keeps the graph in JVM heap; `on_disk` uses memory-mapped files.
+      default: in_memory
+
+    Compression:
+      type: string
+      enum: [none, 1x, 2x, 4x, 8x, 16x, 32x]
+      description: Product-quantisation compression level (Faiss on_disk mode only).
+      default: none
+
+    DataType:
+      type: string
+      enum: [float, byte, fp16, binary]
+      description: |
+        Vector element type stored in the index.
+        - `float` — 32-bit float (default).
+        - `byte` — int8; vectors are scaled to [-127, 127] by the loader before
+          indexing/querying (preserves cosine order for L2-normalised embeddings).
+        - `fp16` — 16-bit float (Faiss only).
+        - `binary` — bit-packed hamming; not yet implemented in the loader.
+      default: float
+
+    BenchType:
+      type: string
+      enum: [index, search, recall, hybrid, stress, recover, plan_change]
+      description: |
+        Benchmark type.
+        - `index` — measure bulk-index throughput at various batch sizes.
+        - `search` — measure k-NN search latency / throughput (rounds or sustained mode).
+        - `recall` — measure k@10 recall accuracy against ground-truth nearest neighbours.
+        - `hybrid` — measure latency/recall with a BM25+kNN hybrid query and optional filter.
+        - `stress` — concurrent index + search load test; supports live plan changes.
+        - `recover` — measure service warm-up latency after an idle period.
+        - `plan_change` — trigger an Aiven service plan change and measure impact.
+
+    FilterSelectivity:
+      type: string
+      enum: [none, low, high]
+      description: |
+        Pre-filter applied to the hybrid / recall query.
+        - `none` — no filter (pure k-NN).
+        - `low` — filter retains ~10% of documents (selective; harder for the index).
+        - `high` — filter retains ~90% of documents (permissive; close to unfiltered).
+      default: none
+
+    KnnSpec:
+      type: object
+      required: [engine, method, space_type]
+      description: Full k-NN index configuration for a single benchmark cell.
+      properties:
+        engine:
+          $ref: '#/components/schemas/Engine'
+        method:
+          $ref: '#/components/schemas/Method'
+        space_type:
+          $ref: '#/components/schemas/SpaceType'
+        mode:
+          $ref: '#/components/schemas/Mode'
+        compression:
+          $ref: '#/components/schemas/Compression'
+        data_type:
+          $ref: '#/components/schemas/DataType'
+        hnsw_m:
+          type: integer
+          default: 16
+          description: HNSW graph degree — number of bidirectional links per node. Higher M = better recall, more memory.
+        hnsw_ef_construction:
+          type: integer
+          default: 100
+          description: Candidate list size during index construction. Higher = better recall quality at build cost.
+        hnsw_ef_search:
+          type: integer
+          default: 256
+          description: |
+            Candidate list size during k-NN graph traversal at query time.
+            Higher values improve recall at the cost of search latency.
+        with_text:
+          type: boolean
+          default: false
+          description: Include the raw description text field in the indexed document (needed for hybrid BM25+kNN).
+        with_metadata:
+          type: boolean
+          default: false
+          description: Include the corpus metadata field (category, source) in the indexed document.
+        derived_source:
+          type: boolean
+          default: false
+          description: Derive the `source` field from the document text (for corpora without a dedicated source column).
+
+    TargetOpenSearch:
+      type: object
+      required: [uri]
+      properties:
+        uri:
+          type: string
+          description: |
+            Full URI including credentials, e.g. `https://avnadmin:secret@os-bench.aivencloud.com:12345`.
+            Provided by the orchestrator at submit time; never persisted on the loader's disk.
+          examples:
+            - https://avnadmin:secret@os-bench.aivencloud.com:12345
+
+    JobSpec:
+      type: object
+      required: [job_id, bench_type, service_label, target_opensearch, opensearch_index, spec]
+      description: |
+        Fully-described unit of benchmark work. All optional numeric fields
+        fall back to sensible defaults or to the loaded corpus metadata when
+        omitted (`embed_dim`, `doc_count`, `query_count`).
+      properties:
+        job_id:
+          type: string
+          description: Unique job identifier assigned by the orchestrator (UUID or slug).
+        bench_type:
+          $ref: '#/components/schemas/BenchType'
+        service_label:
+          type: string
+          description: Human-readable tag included in report filenames and ClickHouse rows (e.g. "os-2.19-business-8").
+        target_opensearch:
+          $ref: '#/components/schemas/TargetOpenSearch'
+        opensearch_index:
+          type: string
+          description: OpenSearch index name for this run.
+        spec:
+          $ref: '#/components/schemas/KnnSpec'
+        embed_dim:
+          type: integer
+          nullable: true
+          default: null
+          description: Embedding dimension. Omit to use the value from the loaded corpus (`GET /corpus/status`).
+        doc_count:
+          type: integer
+          nullable: true
+          default: null
+          description: Documents to index. Omit to use the loaded corpus doc_count.
+        query_count:
+          type: integer
+          nullable: true
+          default: null
+          description: Query vectors for search/recall. Omit to use the loaded corpus query_count.
+        rounds:
+          type: integer
+          default: 3
+          description: Number of measurement rounds (`bench_type=search`, rounds mode only).
+        k:
+          type: integer
+          default: 10
+          description: k nearest neighbours to retrieve in search/recall/hybrid.
+        batch_sizes:
+          type: array
+          items:
+            type: integer
+          default: [1, 5, 10, 20, 50]
+          description: Bulk-index batch sizes to sweep (`bench_type=index` only).
+        warmup_queries:
+          type: integer
+          default: 50
+          description: Number of warmup queries before measurement begins (`bench_type=search`).
+        search_clients:
+          type: integer
+          default: 1
+          description: Parallel search worker threads (`bench_type=search`).
+        target_throughput:
+          type: number
+          format: float
+          default: 0.0
+          description: Target ops/s rate cap for search; 0 = unlimited (rounds mode).
+        time_period:
+          type: integer
+          default: 0
+          description: Duration in seconds for sustained-mode search; 0 = rounds mode.
+        force_merge_segments:
+          type: integer
+          default: 0
+          description: Merge the index to N segments before search; 0 = skip.
+        filter_selectivity:
+          $ref: '#/components/schemas/FilterSelectivity'
+        stress_index_clients:
+          type: integer
+          default: 8
+          description: Concurrent bulk-index threads (`bench_type=stress`).
+        stress_search_clients:
+          type: integer
+          default: 16
+          description: Concurrent search threads (`bench_type=stress`).
+        stress_duration:
+          type: integer
+          default: 120
+          description: Stress test total duration in seconds.
+        stress_batch_size:
+          type: integer
+          default: 100
+          description: Documents per `_bulk` request during stress indexing.
+        stress_k:
+          type: integer
+          default: 100
+          description: k for k-NN search during stress (high k = more JVM heap pressure).
+        plan_change_target:
+          type: string
+          default: ""
+          description: Aiven plan name to change to mid-stress (empty = no change during stress).
+        plan_change_after_s:
+          type: integer
+          default: 60
+          description: Seconds into the stress run before triggering the plan change.
+        post_settle_s:
+          type: integer
+          default: 60
+          description: Seconds to continue measuring after the plan change settles.
+        aiven_api_token:
+          type: string
+          default: ""
+          description: Aiven API token for plan changes (stress or plan_change bench types).
+        aiven_project:
+          type: string
+          default: ""
+        aiven_service_name:
+          type: string
+          default: ""
+        recover_idle_minutes:
+          type: integer
+          default: 10
+          description: "`bench_type=recover` — minutes to let the service idle before measuring warm-up latency."
+        plan_change_from_plan:
+          type: string
+          default: ""
+          description: "`bench_type=plan_change` — current plan name (omit to auto-detect via Aiven API)."
+        plan_change_and_back:
+          type: boolean
+          default: false
+          description: "`bench_type=plan_change` — if true, change plan then revert after post_settle_s."
+        plan_change_pre_load_seconds:
+          type: integer
+          default: 60
+          description: "`bench_type=plan_change` — seconds of search load before initiating the plan change."
+
+    MatrixCell:
+      type: object
+      required: [cell_label, jobs]
+      description: |
+        One named cell in a benchmark matrix (e.g. "L01").
+        All jobs within a cell execute sequentially in the order listed.
+        Typically: index → search → recall → hybrid.
+      properties:
+        cell_label:
+          type: string
+          description: Short identifier shown in SSE events and ClickHouse rows (e.g. "L01").
+        jobs:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/JobSpec'
+
+    MatrixRequest:
+      type: object
+      required: [matrix_id, cells]
+      description: |
+        A full benchmark matrix plan submitted by the orchestrator.
+        Cells execute sequentially; jobs within each cell execute sequentially.
+        SSE events carry per-cell and per-matrix summaries.
+      properties:
+        matrix_id:
+          type: string
+          description: Unique run identifier for this matrix execution (assigned by orchestrator).
+        cells:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/MatrixCell'
+        stop_on_failure:
+          type: boolean
+          default: false
+          description: |
+            When `true`, the matrix aborts on the first cell failure.
+            When `false` (default), failed cells are logged and execution continues.
+
+    Dataset:
+      type: string
+      enum: [mixed, scifact, fiqa, msmarco, quora]
+      description: Corpus preset or BeIR dataset name.
+
+    CorpusConfig:
+      type: object
+      required: [dataset, model, docs_n, queries_n]
+      properties:
+        dataset:
+          $ref: '#/components/schemas/Dataset'
+        model:
+          type: string
+          description: HuggingFace sentence-transformers model ID.
+          examples:
+            - nomic-ai/nomic-embed-text-v1.5
+        docs_n:
+          type: integer
+          description: Target number of documents to embed.
+        queries_n:
+          type: integer
+          description: Target number of query vectors to embed.
+        hf_token:
+          type: string
+          default: ""
+          description: HuggingFace token for gated models; empty for public models.
+        with_metadata:
+          type: boolean
+          default: false
+          description: Include metadata fields (category, source) in the corpus documents.
+        with_groundtruth:
+          type: boolean
+          default: true
+          description: Compute and store ground-truth nearest neighbours after building.
+
+    CorpusFetchRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          description: Pre-signed HTTPS URL pointing to a `.tar.gz` corpus archive.
+        sha256:
+          type: string
+          nullable: true
+          description: Expected SHA-256 of `docs_embeddings.npy`; omit to skip verification.
+
+    CorpusState:
+      type: string
+      enum: [missing, building, ready]
+
+    CorpusStatus:
+      type: object
+      required: [state]
+      properties:
+        state:
+          $ref: '#/components/schemas/CorpusState'
+        config:
+          $ref: '#/components/schemas/CorpusConfig'
+          nullable: true
+        built_at:
+          type: string
+          format: date-time
+          nullable: true
+        sha256:
+          type: string
+          nullable: true
+          description: SHA-256 of the `docs_embeddings.npy` file.
+        doc_count:
+          type: integer
+          nullable: true
+        query_count:
+          type: integer
+          nullable: true
+        embed_dim:
+          type: integer
+          nullable: true
+
+    HealthResponse:
+      type: object
+      required: [status, corpus_state]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        corpus_state:
+          $ref: '#/components/schemas/CorpusState'
+
+    ResultFile:
+      type: object
+      required: [name, size, modified]
+      properties:
+        name:
+          type: string
+          description: Filename (e.g. `bench-search-20260430-191356.json`).
+        size:
+          type: integer
+          description: File size in bytes.
+        modified:
+          type: string
+          format: date-time
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    CancelResponse:
+      type: object
+      required: [cancelled]
+      properties:
+        cancelled:
+          type: boolean
+
+    DeleteCorpusResponse:
+      type: object
+      required: [deleted]
+      properties:
+        deleted:
+          type: boolean
+
+paths:
+
+  /run:
+    post:
+      operationId: runJob
+      summary: Submit a benchmark job
+      description: |
+        Start a single benchmark job and stream logs + result as SSE.
+
+        The response is a `text/event-stream`.  The stream emits:
+        - `event: log` — one log line at a time (stdout/stderr of the bench command).
+        - `event: result` — final JSON `{"ok": bool, "report_path": "…"}`.
+
+        The stream closes after the `result` event.
+
+        **One job at a time:** the loader serialises jobs with a single mutex.
+        Concurrent calls block until the current job completes.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobSpec'
+            examples:
+              L01_index:
+                summary: Index benchmark — Faiss HNSW float (L01)
+                value:
+                  job_id: "l01-index-001"
+                  bench_type: index
+                  service_label: "os-2.19-local"
+                  target_opensearch:
+                    uri: "http://admin:admin@localhost:9200"
+                  opensearch_index: "bench-l01"
+                  spec:
+                    engine: faiss
+                    method: hnsw
+                    space_type: innerproduct
+                    mode: in_memory
+                    data_type: float
+                    hnsw_m: 16
+                    hnsw_ef_construction: 100
+                    hnsw_ef_search: 256
+              L08_search:
+                summary: Search benchmark — Faiss HNSW byte vectors (L08)
+                value:
+                  job_id: "l08-search-001"
+                  bench_type: search
+                  service_label: "os-2.19-local"
+                  target_opensearch:
+                    uri: "http://admin:admin@localhost:9200"
+                  opensearch_index: "bench-l08"
+                  spec:
+                    engine: faiss
+                    method: hnsw
+                    space_type: innerproduct
+                    data_type: byte
+                    hnsw_ef_search: 256
+                  rounds: 3
+                  k: 10
+      responses:
+        '200':
+          description: SSE stream of log lines followed by the final result.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                event: log
+                data: [loader] Starting index job l01-index-001
+
+                event: log
+                data: [bench-index] Indexing 2000 docs …
+
+                event: result
+                data: {"ok": true, "report_path": "/data/results/bench-index-20260430-120000.json"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Corpus not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /cancel/{job_id}:
+    post:
+      operationId: cancelJob
+      summary: Cancel a running job
+      description: Set the cancellation event for the named job. The job may not stop immediately.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Cancellation queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No running job with that job_id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /matrix:
+    post:
+      operationId: runMatrix
+      summary: Submit a full benchmark matrix
+      description: |
+        Submit an ordered list of benchmark cells (e.g. the full L01–L08 plan)
+        for sequential execution.  The loader executes all cells and all jobs
+        within each cell in order, streaming progress as SSE.
+
+        The response is a `text/event-stream`.  Event types:
+
+        | Event | Data |
+        |---|---|
+        | `cell_start` | `{"matrix_id","cell","job_index","total_jobs","bench_type"}` |
+        | `log` | free-form log line |
+        | `cell_result` | `{"matrix_id","cell","ok"}` |
+        | `matrix_result` | `{"matrix_id","cells_ok","cells_failed","results":[…]}` |
+
+        The stream closes after the `matrix_result` event.
+
+        **Tip:** set `stop_on_failure: false` (default) so the orchestrator sees
+        results for all cells even when one fails.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatrixRequest'
+            examples:
+              full_plan:
+                summary: L01–L03 plan fragment
+                value:
+                  matrix_id: "run-2026-04-30"
+                  stop_on_failure: false
+                  cells:
+                    - cell_label: "L01"
+                      jobs:
+                        - job_id: "l01-index"
+                          bench_type: index
+                          service_label: "os-2.19-local"
+                          target_opensearch:
+                            uri: "http://admin:admin@localhost:9200"
+                          opensearch_index: "bench-l01"
+                          spec:
+                            engine: faiss
+                            method: hnsw
+                            space_type: innerproduct
+                        - job_id: "l01-search"
+                          bench_type: search
+                          service_label: "os-2.19-local"
+                          target_opensearch:
+                            uri: "http://admin:admin@localhost:9200"
+                          opensearch_index: "bench-l01"
+                          spec:
+                            engine: faiss
+                            method: hnsw
+                            space_type: innerproduct
+      responses:
+        '200':
+          description: SSE stream of matrix execution events.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                event: cell_start
+                data: {"matrix_id":"run-2026-04-30","cell":"L01","job_index":0,"total_jobs":4,"bench_type":"index"}
+
+                event: log
+                data: [loader] Starting index job l01-index
+
+                event: cell_result
+                data: {"matrix_id":"run-2026-04-30","cell":"L01","ok":true}
+
+                event: matrix_result
+                data: {"matrix_id":"run-2026-04-30","cells_ok":1,"cells_failed":0,"results":[{"cell":"L01","ok":true}]}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /corpus/build:
+    post:
+      operationId: buildCorpus
+      summary: Build a corpus on the loader
+      description: |
+        Trigger on-device corpus embedding using the model and dataset specified.
+        Streams build progress as SSE.  Requires the loader to have the `[build]`
+        Python extras installed (not available in the lean Docker image — use
+        `POST /corpus/upload` or `POST /corpus/fetch` to supply a pre-built corpus).
+
+        SSE event types: `log` (progress lines), `ready` (CorpusStatus JSON), `error`.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CorpusConfig'
+            examples:
+              smoke:
+                summary: Build 2k-doc corpus with nomic model
+                value:
+                  dataset: mixed
+                  model: nomic-ai/nomic-embed-text-v1.5
+                  docs_n: 2000
+                  queries_n: 200
+                  with_groundtruth: true
+      responses:
+        '200':
+          description: SSE stream of build progress.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Build already in progress.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /corpus/upload:
+    post:
+      operationId: uploadCorpus
+      summary: Upload a pre-built corpus archive
+      description: |
+        Upload a `.tar.gz` archive containing the corpus artifacts.
+
+        **Required files inside the archive:**
+        - `manifest.json`
+        - `docs.parquet`
+        - `queries.parquet`
+        - `docs_embeddings.npy`
+        - `queries_embeddings.npy`
+
+        Optional: `qrels.npy` (ground-truth nearest neighbours).
+
+        Only the canonical filenames above are extracted; any other members
+        are silently skipped (path traversal protection).
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Corpus installed successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CorpusStatus'
+        '400':
+          description: Invalid or corrupt archive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Cannot upload while a build or job is in progress.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /corpus/fetch:
+    post:
+      operationId: fetchCorpus
+      summary: Fetch a corpus from a pre-signed URL
+      description: |
+        Download and install a `.tar.gz` corpus archive from a pre-signed URL.
+        The orchestrator uses this endpoint to push a remotely-stored corpus to
+        the loader without needing a direct upload.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CorpusFetchRequest'
+      responses:
+        '200':
+          description: Corpus fetched and installed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CorpusStatus'
+        '400':
+          description: URL unreachable or invalid archive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Cannot fetch while a build or job is in progress.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /corpus/status:
+    get:
+      operationId: getCorpusStatus
+      summary: Get corpus state
+      description: Returns the current in-memory corpus state including doc/query counts and embed_dim.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Current corpus state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CorpusStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /corpus:
+    delete:
+      operationId: deleteCorpus
+      summary: Delete the corpus
+      description: Wipe the corpus directory and reset state to `missing`.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Corpus deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteCorpusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Cannot delete while a build or job is running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /results:
+    get:
+      operationId: listResults
+      summary: List available result files
+      description: Returns a list of benchmark result files (`.json` and `.md`) in the results directory.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of result files.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ResultFile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /results/{filename}:
+    get:
+      operationId: downloadResult
+      summary: Download a result file
+      description: |
+        Download a single benchmark result by filename.
+        Returns `application/json` or `text/markdown` depending on the file extension.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: filename
+          in: path
+          required: true
+          schema:
+            type: string
+          example: bench-search-20260430-191356.json
+      responses:
+        '200':
+          description: File contents.
+          content:
+            application/json:
+              schema:
+                type: object
+            text/markdown:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: File not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /healthz:
+    get:
+      operationId: healthz
+      summary: Health check
+      description: Returns `{"status":"ok"}` and the current corpus state. No authentication required.
+      security: []
+      responses:
+        '200':
+          description: Service is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /metrics:
+    get:
+      operationId: prometheusMetrics
+      summary: Prometheus metrics
+      description: |
+        Prometheus text format exposition (OpenMetrics-compatible).
+        Scraped by Thanos or any Prometheus-compatible collector.
+        No authentication required.
+      security: []
+      responses:
+        '200':
+          description: Prometheus exposition text.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  components:
+    responses:
+      Unauthorized:
+        description: Missing or invalid Bearer token.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorResponse'
+      UnprocessableEntity:
+        description: Request body validation failed or required fields could not be resolved from corpus.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorResponse'

@@ -1,0 +1,48 @@
+# Local single-node OpenSearch for running benchmarks via Colima.
+#
+# Usage:
+#   colima start --cpu 4 --memory 8 --disk 60
+#   docker compose -f docker-compose.opensearch.yml up -d
+#   curl http://localhost:9200/_cluster/health?pretty
+#
+# Stop and remove data:
+#   docker compose -f docker-compose.opensearch.yml down -v
+#
+# Notes:
+#   - Security plugin disabled for local dev (no TLS, no auth required).
+#   - JVM heap fixed at 1g (fits Colima default 2 GiB); increase to 2-4g for larger corpora.
+#   - Port 9200 is mapped to localhost; bench containers reach it via
+#     --opensearch-uri http://host.docker.internal:9200 or, when running
+#     with --network host, http://localhost:9200.
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.19.0
+    container_name: opensearch-local
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - cluster.name=bench-local
+      - node.name=bench-node-1
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -v '\"status\":\"red\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  opensearch-data:
