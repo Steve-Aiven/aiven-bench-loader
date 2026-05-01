@@ -20,7 +20,7 @@
 #   colima start --cpu 4 --memory 8 --disk 100     # 8 GB for OpenSearch headroom
 #
 # Build time estimates (768-dim nomic, MPS):
-#   Embedding:    ~30–45 min  (100k docs at batch_size=64)
+#   Embedding:    ~45–75 min  (100k docs at batch_size=16; nomic-bert-2048 needs small batches)
 #   Groundtruth:  ~8–15 min   (10k queries × 100k docs, chunked NumPy)
 #   Total:        ~45–60 min
 #
@@ -46,7 +46,7 @@ OUT_DIR="${OUT_DIR:-${REPO_ROOT}/corpus-100k}"
 DOC_COUNT="${DOC_COUNT:-100000}"
 QUERY_COUNT="${QUERY_COUNT:-10000}"
 SEED="${SEED:-42}"
-EMBED_BATCH_SIZE="${EMBED_BATCH_SIZE:-64}"
+EMBED_BATCH_SIZE="${EMBED_BATCH_SIZE:-16}"
 DATASET="${DATASET:-mixed}"
 
 export HF_EMBED_DEVICE="${HF_EMBED_DEVICE:-mps}"

@@ -10,7 +10,7 @@
 #
 # Notes:
 #   - Security plugin disabled for local dev (no TLS, no auth required).
-#   - JVM heap fixed at 1g (fits Colima default 2 GiB); increase to 2-4g for larger corpora.
+#   - JVM heap set to 2g (requires Colima ≥ 8 GiB); use 1g if running with 4 GiB Colima.
 #   - Port 9200 is mapped to localhost; bench containers reach it via
 #     --opensearch-uri http://host.docker.internal:9200 or, when running
 #     with --network host, http://localhost:9200.
@@ -22,7 +22,7 @@ services:
     environment:
       - discovery.type=single-node
       - DISABLE_SECURITY_PLUGIN=true
-      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g
       - cluster.name=bench-local
       - node.name=bench-node-1
     ulimits:

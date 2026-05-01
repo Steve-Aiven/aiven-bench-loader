@@ -15,7 +15,7 @@
 #   bash scripts/build-corpus-20k.sh
 #
 # Override defaults via environment:
-#   HF_EMBED_DEVICE=cpu EMBED_BATCH_SIZE=32 bash scripts/build-corpus-20k.sh
+#   HF_EMBED_DEVICE=cpu EMBED_BATCH_SIZE=8 bash scripts/build-corpus-20k.sh
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,7 +25,7 @@ OUT_DIR="${OUT_DIR:-${REPO_ROOT}/corpus-20k}"
 DOC_COUNT="${DOC_COUNT:-20000}"
 QUERY_COUNT="${QUERY_COUNT:-2000}"
 SEED="${SEED:-42}"
-EMBED_BATCH_SIZE="${EMBED_BATCH_SIZE:-64}"
+EMBED_BATCH_SIZE="${EMBED_BATCH_SIZE:-16}"
 DATASET="${DATASET:-mixed}"
 
 export HF_EMBED_DEVICE="${HF_EMBED_DEVICE:-mps}"
