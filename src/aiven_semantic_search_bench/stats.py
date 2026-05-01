@@ -68,6 +68,63 @@ def percentiles_ms(values_ms: list[float]) -> dict[str, float]:
     }
 
 
+def percentile_confidence(n: int) -> dict[str, str]:
+    """
+    Classify statistical confidence for each standard percentile level given
+    ``n`` samples. Uses the rule-of-thumb minimum: at least ``100 / (1-p)``
+    samples for reliable estimation at percentile ``p``.
+
+    Returns a dict mapping percentile name → ``"ok"``, ``"low"``, or
+    ``"insufficient"``.  Attach this to report notes so the reader knows
+    which tail numbers to trust.
+
+    Examples:
+        n=500  → p99 is "low"   (need ~1,000; have 500)
+        n=1500 → p99 is "ok"    (3 rounds × 500 queries)
+        n=500  → p99.9 is "insufficient" (need ~10,000)
+    """
+    thresholds = {
+        "p50":   20,
+        "p90":   100,
+        "p95":   200,
+        "p99":   1_000,
+        "p99.9": 10_000,
+    }
+    result: dict[str, str] = {}
+    for pct, min_ok in thresholds.items():
+        if n >= min_ok:
+            result[pct] = "ok"
+        elif n >= min_ok // 5:
+            result[pct] = "low"
+        else:
+            result[pct] = "insufficient"
+    return result
+
+
+def confidence_note(n: int) -> str:
+    """
+    Human-readable one-liner for report notes.  E.g.:
+      "500 samples: p50/p90/p95 reliable, p99 low (need ~1,000), p99.9 insufficient (need ~10,000)."
+    """
+    conf = percentile_confidence(n)
+    thresholds = {"p50": 20, "p90": 100, "p95": 200, "p99": 1_000, "p99.9": 10_000}
+    ok = [p for p, s in conf.items() if s == "ok"]
+    low = [p for p, s in conf.items() if s == "low"]
+    bad = [p for p, s in conf.items() if s == "insufficient"]
+    parts: list[str] = []
+    if ok:
+        parts.append(f"{'/'.join(ok)} reliable")
+    if low:
+        parts.append(", ".join(
+            f"{p} low (need ~{thresholds[p]:,})" for p in low
+        ))
+    if bad:
+        parts.append(", ".join(
+            f"{p} insufficient (need ~{thresholds[p]:,})" for p in bad
+        ))
+    return f"{n:,} samples: {'; '.join(parts)}."
+
+
 def chunked(items: list, batch_size: int) -> list[list]:
     """Split `items` into chunks of at most `batch_size` items."""
     if batch_size <= 0:

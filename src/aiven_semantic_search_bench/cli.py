@@ -267,6 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("--query-count", type=int, default=500)
     sp.add_argument("--k", type=int, default=10)
+    sp.add_argument(
+        "--search-clients",
+        type=int,
+        default=1,
+        help="Parallel query threads (default: 1). Raise to stress recall under concurrency.",
+    )
     sp.add_argument("--label", default="unlabeled")
     sp.add_argument("--out-dir", default="results")
     _add_corpus_args(sp)
@@ -422,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
             label=str(args.label),
             out_dir=str(args.out_dir),
             opensearch_uri=args.opensearch_uri,
+            search_clients=int(args.search_clients),
         )
 
     if args.command == "bench-hybrid":

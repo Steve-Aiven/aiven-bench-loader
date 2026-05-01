@@ -17,11 +17,22 @@ Setup
 ------
 Run ``bench-index`` first to populate the index, then ``bench-recall``
 against the same index.  The ``--embed-dim`` and ``--k`` must match.
+
+Concurrency
+-----------
+``--search-clients N`` runs N worker threads in parallel, identical to
+``bench-search --search-clients N``.  Each thread handles its own slice of
+queries; results are merged after all threads finish.  Use ``search_clients=1``
+(the default) for the cleanest serial measurement; raise it to stress-test
+recall accuracy under concurrent load.
 """
 
 from __future__ import annotations
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +44,7 @@ from .corpus import load_corpus
 from .opensearch_client import KnnSpec, encode_vector, get_index_stats, get_opensearch_client
 from .report_context import benchmark_report_extras
 from .reporter import raw_samples_enabled, write_report
-from .stats import percentiles_ms
+from .stats import confidence_note, percentiles_ms
 
 _QRELS_NAME = "qrels.npy"
 _RECALL_KS = (1, 5, 10, 50, 100)
@@ -84,6 +95,7 @@ def cmd_bench_recall(
     out_dir: str,
     label: str,
     opensearch_uri: str | None = None,
+    search_clients: int = 1,
 ) -> int:
     uri = opensearch_uri or settings.opensearch_uri
     knn = spec or KnnSpec(embed_dim=embed_dim)
@@ -131,27 +143,64 @@ def cmd_bench_recall(
     query_vectors = bundle.query_vectors[:query_count]
 
     max_k = min(k, gt_k)
-    recall_sums = {rk: 0.0 for rk in _RECALL_KS if rk <= max_k}
-    latencies_ms: list[float] = []
     save_raw = raw_samples_enabled()
-    raw_queries: list[dict[str, Any]] = []
 
     print(
-        f"[bench-recall] Running {query_count} queries (k={k}, dim={embed_dim})..."
+        f"[bench-recall] Running {query_count} queries "
+        f"(k={k}, dim={embed_dim}, search_clients={search_clients})..."
     )
-    for q_idx, vec in enumerate(query_vectors):
-        true_row_indices = qrels[q_idx][:max_k]
-        true_ids = {idx_to_id[int(i)] for i in true_row_indices if int(i) in idx_to_id}
 
-        t0 = time.perf_counter()
-        retrieved = _knn_search_ids(client, settings.opensearch_index, vec, k=k, data_type=knn.data_type)
-        lat_ms = (time.perf_counter() - t0) * 1000
+    # ── Work items: (q_idx, vector, true_ids) ──────────────────────────────
+    work_items: list[tuple[int, np.ndarray, set[str]]] = []
+    for q_idx in range(query_count):
+        true_ids = {
+            idx_to_id[int(i)]
+            for i in qrels[q_idx][:max_k]
+            if int(i) in idx_to_id
+        }
+        work_items.append((q_idx, query_vectors[q_idx], true_ids))
+
+    # ── Parallel search ────────────────────────────────────────────────────
+    # Per-thread results: (q_idx, lat_ms, ts_utc, retrieved_ids, true_ids)
+    collected: list[tuple[int, float, str, list[str], set[str]]] = []
+    lock = threading.Lock()
+
+    def _worker(items: list[tuple[int, np.ndarray, set[str]]]) -> None:
+        local: list[tuple[int, float, str, list[str], set[str]]] = []
+        for q_idx, vec, true_ids in items:
+            ts_utc = datetime.now(timezone.utc).isoformat()
+            t0 = time.perf_counter()
+            retrieved = _knn_search_ids(
+                client, settings.opensearch_index, vec, k=k, data_type=knn.data_type
+            )
+            lat_ms = (time.perf_counter() - t0) * 1000
+            local.append((q_idx, lat_ms, ts_utc, retrieved, true_ids))
+        with lock:
+            collected.extend(local)
+
+    # Partition work across threads
+    chunk_size = max(1, (len(work_items) + search_clients - 1) // search_clients)
+    chunks = [work_items[i : i + chunk_size] for i in range(0, len(work_items), chunk_size)]
+
+    with ThreadPoolExecutor(max_workers=search_clients) as pool:
+        futs = [pool.submit(_worker, chunk) for chunk in chunks]
+        for fut in as_completed(futs):
+            fut.result()  # re-raise any worker exception
+
+    # ── Aggregate results (sort by q_idx for deterministic raw output) ─────
+    collected.sort(key=lambda x: x[0])
+
+    recall_sums = {rk: 0.0 for rk in _RECALL_KS if rk <= max_k}
+    latencies_ms: list[float] = []
+    raw_queries: list[dict[str, Any]] = []
+
+    for q_idx, lat_ms, ts_utc, retrieved, true_ids in collected:
         latencies_ms.append(lat_ms)
-
         for rk in recall_sums:
             recall_sums[rk] += _recall_at_k(retrieved, true_ids, rk)
 
         if save_raw:
+            true_row_indices = qrels[q_idx][:max_k]
             gt_ordered = [
                 idx_to_id[int(i)]
                 for i in true_row_indices
@@ -159,6 +208,7 @@ def cmd_bench_recall(
             ]
             row: dict[str, Any] = {
                 "query_idx": q_idx,
+                "ts": ts_utc,
                 "latency_ms": round(lat_ms, 3),
                 "retrieved_doc_ids": list(retrieved),
                 "ground_truth_doc_ids": gt_ordered,
@@ -175,8 +225,6 @@ def cmd_bench_recall(
 
     sink = get_sink()
     for rk, score in recall_results.items():
-        # Tag with k so the orchestrator's recall_floor rule can target a
-        # specific k. e.g. labels={"k": "10"} → recall_at_k for k=10.
         k_value = rk.split("@", 1)[1]
         sink.metric("recall_at_k", float(score), labels={"k": k_value})
     sink.metric("search_p50_ms", float(lat["p50_ms"]), labels={"phase": "recall"})
@@ -186,6 +234,7 @@ def cmd_bench_recall(
     result_row = {
         "queries":    query_count,
         "k":          k,
+        "clients":    search_clients,
         "p50_ms":     round(lat["p50_ms"], 1),
         "p95_ms":     round(lat["p95_ms"], 1),
         "p99_ms":     round(lat["p99_ms"], 1),
@@ -209,6 +258,7 @@ def cmd_bench_recall(
             "doc_count":     doc_count,
             "query_count":   query_count,
             "k":             k,
+            "search_clients": search_clients,
             "embed_dim":     embed_dim,
             "knn_spec":      knn.to_dict(),
             "corpus_preset": bundle.manifest.get("preset"),
@@ -224,6 +274,8 @@ def cmd_bench_recall(
             f"Ground truth computed at dim={bundle.manifest.get('groundtruth_dim', 'MAX_DIM')} "
             f"(brute-force cosine similarity).",
             f"k-NN spec: {knn.label()}",
+            f"Latency confidence: {confidence_note(query_count)} "
+            "(serial single-client; use bench-search --search-clients N for concurrent latency).",
         ],
         out_dir=out_dir,
         raw_data=raw_payload,

@@ -43,6 +43,7 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -57,8 +58,8 @@ from .opensearch_client import (
     get_opensearch_client,
 )
 from .report_context import benchmark_report_extras
-from .reporter import write_report
-from .stats import percentiles_ms
+from .reporter import raw_samples_enabled, write_report
+from .stats import confidence_note, percentiles_ms
 
 # ── Warmup constants (mirroring OSB's warmup-knn-indices runner) ──────────────
 _WARMUP_STABILITY_THRESHOLD = 0.10  # <10 % Δp95 ⇒ latency is stable
@@ -154,6 +155,7 @@ def _run_rounds(
     rounds: int,
     search_clients: int,
     data_type: str = "float",
+    raw_samples: list | None = None,
 ) -> list[dict]:
     """
     Rounds mode: for each round dispatch all ``len(query_vectors)`` queries
@@ -161,6 +163,10 @@ def _run_rounds(
 
     Using ``search_clients > 1`` applies concurrency pressure to the cluster
     and is closer to a real serving workload than strictly serial queries.
+
+    When ``raw_samples`` is a list, each query appends a dict with ``ts``
+    (UTC ISO-8601 wall-clock at dispatch), ``round``, ``query_idx``, and
+    ``latency_ms`` for post-hoc correlation with GC pauses or network events.
     """
     all_latencies: list[float] = []
     results: list[dict] = []
@@ -170,25 +176,38 @@ def _run_rounds(
         round_lats: list[float] = []
         lock = threading.Lock()
 
-        # Partition query vectors across workers
+        # Partition query vectors across workers; track the start index per
+        # chunk so query_idx values are consistent within the round.
         n = len(query_vectors)
         chunk_size = max(1, (n + search_clients - 1) // search_clients)
         chunks = [
-            query_vectors[i : i + chunk_size]
+            (i, query_vectors[i : i + chunk_size])
             for i in range(0, n, chunk_size)
         ]
 
-        def _worker(vecs: np.ndarray) -> None:
+        def _worker(offset: int, vecs: np.ndarray) -> None:
             local_lats: list[float] = []
-            for v in vecs:
+            local_raw: list[dict] = []
+            for i, v in enumerate(vecs):
+                ts = datetime.now(timezone.utc).isoformat()
                 t0 = time.perf_counter()
                 _knn_search(client, index, v, k=k, ef_search=ef_search, data_type=data_type)
-                local_lats.append((time.perf_counter() - t0) * 1000)
+                lat_ms = (time.perf_counter() - t0) * 1000
+                local_lats.append(lat_ms)
+                if raw_samples is not None:
+                    local_raw.append({
+                        "ts": ts,
+                        "round": r,
+                        "query_idx": offset + i,
+                        "latency_ms": round(lat_ms, 3),
+                    })
             with lock:
                 round_lats.extend(local_lats)
+                if raw_samples is not None:
+                    raw_samples.extend(local_raw)
 
         with ThreadPoolExecutor(max_workers=search_clients) as pool:
-            futs = [pool.submit(_worker, chunk) for chunk in chunks]
+            futs = [pool.submit(_worker, offset, chunk) for offset, chunk in chunks]
             for f in as_completed(futs):
                 f.result()  # re-raise any exception from a worker thread
 
@@ -229,6 +248,9 @@ def _run_rounds(
 
 # ── Sustained-throughput mode ─────────────────────────────────────────────────
 
+_BUSY_WAIT_THRESHOLD_S = 0.002  # spin-loop below 2 ms — avoids OS scheduler jitter
+
+
 def _run_sustained(
     client,
     index: str,
@@ -240,6 +262,7 @@ def _run_sustained(
     target_throughput: float,
     time_period: int,
     data_type: str = "float",
+    raw_samples: list | None = None,
 ) -> list[dict]:
     """
     Sustained-throughput mode, modelled on OSB's ``target_throughput`` +
@@ -252,6 +275,10 @@ def _run_sustained(
     If the cluster is slower than the target rate the queue fills up and the
     measured ops/s falls below the target — that gap is itself a useful
     signal (the cluster is saturated at this concurrency level).
+
+    Dispatch intervals shorter than ``_BUSY_WAIT_THRESHOLD_S`` (2 ms) use a
+    spin-loop rather than ``time.sleep`` to avoid OS scheduler jitter at
+    target throughputs above ~500 ops/s.
     """
     interval = 1.0 / target_throughput          # seconds between dispatch slots
     deadline = time.monotonic() + time_period
@@ -267,8 +294,11 @@ def _run_sustained(
         next_t = time.monotonic()
         while time.monotonic() < deadline:
             sleep_for = next_t - time.monotonic()
-            if sleep_for > 0:
-                time.sleep(sleep_for)
+            if sleep_for > _BUSY_WAIT_THRESHOLD_S:
+                time.sleep(sleep_for - _BUSY_WAIT_THRESHOLD_S)
+            # Spin-wait for the final sub-2ms window for precise dispatch timing
+            while time.monotonic() < next_t:
+                pass
             work_q.put(query_vectors[idx % n_vecs])
             idx += 1
             next_t += interval
@@ -281,12 +311,18 @@ def _run_sustained(
             vec = work_q.get()
             if vec is None:
                 break
+            ts = datetime.now(timezone.utc).isoformat()
             t0 = time.perf_counter()
             try:
                 _knn_search(client, index, vec, k=k, ef_search=ef_search, data_type=data_type)
                 lat_ms = (time.perf_counter() - t0) * 1000
                 with lock:
                     latencies.append(lat_ms)
+                    if raw_samples is not None:
+                        raw_samples.append({
+                            "ts": ts,
+                            "latency_ms": round(lat_ms, 3),
+                        })
                 sink.metric("search_latency_ms", lat_ms, labels={"mode": "sustained"})
             except Exception:
                 with lock:
@@ -432,6 +468,9 @@ def cmd_bench_search(
         )
 
     # ── Step 3: measure ───────────────────────────────────────────────────
+    save_raw = raw_samples_enabled()
+    raw_samples_list: list | None = [] if save_raw else None
+
     if sustained_mode:
         results = _run_sustained(
             client,
@@ -443,6 +482,7 @@ def cmd_bench_search(
             target_throughput=target_throughput,
             time_period=time_period,
             data_type=knn.data_type,
+            raw_samples=raw_samples_list,
         )
     else:
         results = _run_rounds(
@@ -454,9 +494,13 @@ def cmd_bench_search(
             rounds=rounds,
             search_clients=search_clients,
             data_type=knn.data_type,
+            raw_samples=raw_samples_list,
         )
 
     # ── Report ────────────────────────────────────────────────────────────
+    n_samples = sum(r.get("queries", 0) for r in results)
+    raw_payload = {"samples": raw_samples_list} if raw_samples_list else None
+
     json_path, md_path, _raw_path = write_report(
         "bench-search",
         params={
@@ -503,13 +547,19 @@ def cmd_bench_search(
             ),
             *(
                 [f"Sustained mode: target={target_throughput:.1f} ops/s, "
-                 f"time_period={time_period}s, clients={search_clients}."]
+                 f"time_period={time_period}s, clients={search_clients}. "
+                 "Feeder uses busy-wait spin-loop below 2 ms to hit dispatch "
+                 "intervals accurately at high QPS."]
                 if sustained_mode
                 else [f"Rounds mode: {rounds} round(s), {search_clients} client(s)."]
             ),
+            f"Latency confidence: {confidence_note(n_samples)}",
         ],
         out_dir=out_dir,
+        raw_data=raw_payload,
     )
     print(f"[bench-search] Wrote: {json_path}")
     print(f"[bench-search] Wrote: {md_path}")
+    if _raw_path:
+        print(f"[bench-search] Wrote: {_raw_path}")
     return 0
